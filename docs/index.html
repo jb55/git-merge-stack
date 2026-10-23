@@ -96,6 +96,9 @@ header h1 span { color: var(--accent); }
 .mg { color: var(--merge); font-weight: 700; }
 .install { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin-top: 24px; color: var(--ink-3); font-size: 0.9rem; }
 .install pre { margin: 0; min-width: 0; max-width: 100%; }
+.links { display: flex; flex-wrap: wrap; gap: 10px 18px; margin-top: 18px; font-size: 0.95rem; }
+.links a { font-weight: 600; text-decoration: none; }
+.links a:hover { text-decoration: underline; }
 
 /* terminal */
 .term {
@@ -186,6 +189,11 @@ footer { padding: 40px 0 64px; border-top: 1px solid var(--rule); color: var(--i
     <div class="install">
       <pre class="plain">cp git-merge-stack ~/bin/ &amp;&amp; git merge-stack show</pre>
       <span>Python 3.11+, stdlib only. git finds it on your <code>PATH</code>.</span>
+    </div>
+    <div class="links">
+      <a href="https://github.com/jb55/git-merge-stack">Source on GitHub</a>
+      <a href="https://github.com/jb55/git-merge-stack/blob/master/git-merge-stack">The script</a>
+      <a href="https://github.com/jb55/git-merge-stack#readme">README</a>
     </div>
   </div>
 </header>
@@ -378,14 +386,15 @@ backups: refs/stack-backup/2026-03-14-161205/</div>
   <div class="wrap">
     <div class="kicker">install</div>
     <h2>One file on your PATH</h2>
-<pre class="plain">cp git-merge-stack ~/bin/
+<pre class="plain">curl -fLo ~/bin/git-merge-stack https://raw.githubusercontent.com/jb55/git-merge-stack/master/git-merge-stack
+chmod +x ~/bin/git-merge-stack
 git merge-stack show</pre>
     <p>It needs Python 3.11 or newer and nothing else. It shells out to the git CLI and uses <code>git merge-tree --write-tree</code>, with <code>--merge-base</code>, so it needs git 2.40 or newer. Use <code>git merge-stack -h</code> for help; <code>--help</code> is caught by git, which looks for a man page.</p>
   </div>
 </section>
 
 <footer>
-  <div class="wrap">git merge-stack · rebase stacks that contain merges, described by one line.</div>
+  <div class="wrap">git merge-stack · rebase stacks that contain merges, described by one line · <a href="https://github.com/jb55/git-merge-stack">GitHub</a> · MIT license</div>
 </footer>
 
 </body>

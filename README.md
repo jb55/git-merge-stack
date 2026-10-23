@@ -19,8 +19,10 @@ itself, which looks for a man page that doesn't exist.
 
 Tests load that same file by path: `uv run --with pytest pytest -q`.
 
-The project's landing page is `docs/index.html`, one self-contained file; GitHub
-Pages can serve it from `/docs`.
+The project's landing page is `docs/index.html`, served at
+https://jb55.github.io/git-merge-stack/.
+
+MIT licensed; see `LICENSE`.
 
 ## The syntax
 
