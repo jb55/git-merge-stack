@@ -58,6 +58,11 @@ MIT licensed; see `LICENSE`.
     git merge-stack show [branch...] [--all | --only] [--tree | --line] [--no-color]
                          [--trunk REF] [--no-record]
 
+A branch can carry a revision, `show X@{2}`, `show X@{yesterday}` or `show
+X~1`, to see the stack as if X were at that commit, say before a restack. The
+other branches stay at their tips, so commits only X's old self reached
+print as hashes, and nothing is recorded under `refs/stack/base/`.
+
 `show X` prints what a restack of X's line could move. Going down, that's X
 and every branch its term names, recursively, through the base, `+` merges
 and `~N`: the tokens you might edit. Going up from those, it's every branch

@@ -289,9 +289,12 @@ class Branch:
 class Graph:
     """The stack-relevant slice of a repo: every commit not on the trunk."""
 
-    def __init__(self, git: Git, trunk: str | None = None):
+    def __init__(self, git: Git, trunk: str | None = None, at: dict[str, str] | None = None):
+        """`at` puts branches at other commits than their tips, for show."""
         self.git = git
         self.refs, upstreams = self._read_refs()
+        for b, c in (at or {}).items():
+            self.refs[f"refs/heads/{b}"] = c
         self.trunk, self.trunk_commit = self._trunk(trunk)
         self.locals = {
             full.removeprefix("refs/heads/"): c
@@ -533,6 +536,28 @@ class Graph:
                     self.git.run("update-ref", BASE_RECORDS + d.name, d.base)
         warnings = [w for d in derived.values() for w in d.warnings]
         return derived, warnings
+
+
+PAST = re.compile(r"(.+?)((?:@\{[^}]*\}|[~^][0-9]*)+)")
+
+
+def past(graph: Graph, tokens: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Branch tokens with a revision on them (`x@{2}`, `x~1`), as the branch
+    names, and each such branch -> the commit it names."""
+    names, at = [], {}
+    for t in tokens:
+        m = PAST.fullmatch(t)
+        if t in graph.locals or not m:
+            names.append(t)
+            continue
+        b = graph.resolve_branch(m[1])
+        c = graph.git.commit(b + m[2])
+        if not c:
+            raise StackError(f"{t!r} names no commit")
+        names.append(b)
+        if c != graph.locals[b]:
+            at[b] = c
+    return names, at
 
 
 def reach(start: set[str], links: dict[str, set[str]]) -> set[str]:
@@ -1418,7 +1443,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--trunk", help="the fixed floor of every stack (default: origin/HEAD, then origin/main, ...)")
     sub = p.add_subparsers(dest="cmd", required=True)
     show = sub.add_parser("show", help="print the line for the stacks in this repo")
-    show.add_argument("branches", nargs="*", help="print what a restack of these could move: what they build on and what builds on that (default: HEAD's branch)")
+    show.add_argument("branches", nargs="*", help="print what a restack of these could move: what they build on and what builds on that (default: HEAD's branch); a branch with a revision on it, like x@{2} or x~1, is shown at that commit")
     which = show.add_mutually_exclusive_group()
     which.add_argument("--all", action="store_true", help="print every branch off the trunk")
     which.add_argument("--only", action="store_true", help="print just the named branches, not their stacks")
@@ -1476,7 +1501,14 @@ def main(argv: list[str] | None = None) -> int:
                 if why:
                     print(f"note: {why}; showing every branch off {short(graph.trunk)}", file=sys.stderr)
                 branches = [head] if head else []
-            derived, warnings = graph.show(branches, record=not args.no_record, expand=bool(branches) and not args.only)
+            branches, at = past(graph, branches)
+            if at:
+                graph = Graph(graph.git, args.trunk, at=at)
+                for b, c in at.items():
+                    print(f"note: {b} is shown at {c[:12]}, not at its tip", file=sys.stderr)
+            # A past state's hash bases aren't recorded: they'd pin today's branches.
+            record = not args.no_record and not at
+            derived, warnings = graph.show(branches, record=record, expand=bool(branches) and not args.only)
             warn(warnings)
             terms = {b: d.term for b, d in derived.items()}
             color = tty() and not args.no_color

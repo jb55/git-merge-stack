@@ -278,3 +278,28 @@ def test_merged_outsider_prints_as_a_name(repo, shape, capsys):
     assert out == f"{shape['m1'][:12]} > {STACK} + other > review"
     out, _ = repo.show("other", capsys=capsys)
     assert out == "origin/master > other ; api-search + other > review"
+
+
+def test_a_branch_at_a_past_commit(repo, shape, capsys):
+    # search gains s3; search@{1} is search before that, s2.
+    before, _ = repo.show("--only", "search", "filters", capsys=capsys)
+    repo.checkout("search")
+    repo.commit("s3")
+    records = repo.git("for-each-ref", "refs/stack/base/")
+    out, err = repo.show("--only", "search@{1}", "filters", capsys=capsys)
+    assert out == before
+    assert f"note: search is shown at {shape['s2'][:12]}, not at its tip" in err
+    assert repo.git("for-each-ref", "refs/stack/base/") == records  # a past state records nothing
+    out, _ = repo.show("--only", "search~1", "filters", capsys=capsys)
+    assert out == before
+
+
+def test_a_branch_at_its_own_tip_is_just_the_branch(repo, shape, capsys):
+    out, err = repo.show("--only", "search@{0}", capsys=capsys)
+    assert out == f"{shape['m1'][:12]} > search"
+    assert "note:" not in err
+
+
+def test_a_revision_that_names_nothing(repo, shape, capsys):
+    assert main(["-C", str(repo.path), "show", "search@{99}"]) == 1
+    assert "'search@{99}' names no commit" in capsys.readouterr().err
