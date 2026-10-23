@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>git merge-stack</title>
+<meta name="description" content="Rebase git stacks that contain merges, described by one line.">
+<style>
+:root {
+  --bg: #fbfaf7;
+  --bg-raised: #ffffff;
+  --bg-code: #f3f1ec;
+  --ink: #1d1c1a;
+  --ink-2: #55524c;
+  --ink-3: #85817a;
+  --rule: #e4e0d8;
+  --accent: #b4561f;
+  --accent-soft: #f6e6da;
+  --merge: #2f6f8f;
+  --ok: #3d7a3a;
+  --term-bg: #1e1d1b;
+  --term-ink: #e8e4dc;
+  --term-dim: #8f8a80;
+  --term-accent: #f0a46c;
+  --term-ok: #9ccf8f;
+  --term-warn: #e8c46a;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161514;
+    --bg-raised: #1e1d1b;
+    --bg-code: #242320;
+    --ink: #ece8e0;
+    --ink-2: #b3aea4;
+    --ink-3: #847f76;
+    --rule: #33312d;
+    --accent: #f0a46c;
+    --accent-soft: #3a2a1f;
+    --merge: #79b8d6;
+    --ok: #9ccf8f;
+    --term-bg: #0f0f0e;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161514;
+  --bg-raised: #1e1d1b;
+  --bg-code: #242320;
+  --ink: #ece8e0;
+  --ink-2: #b3aea4;
+  --ink-3: #847f76;
+  --rule: #33312d;
+  --accent: #f0a46c;
+  --accent-soft: #3a2a1f;
+  --merge: #79b8d6;
+  --ok: #9ccf8f;
+  --term-bg: #0f0f0e;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 17px/1.6 var(--sans);
+}
+.wrap { max-width: 860px; margin: 0 auto; padding: 0 16px; }
+a { color: var(--accent); }
+code, pre, kbd { font-family: var(--mono); }
+code { overflow-wrap: anywhere; font-size: 0.88em; background: var(--bg-code); padding: 0.1em 0.35em; border-radius: 4px; }
+h1, h2, h3 { line-height: 1.2; letter-spacing: -0.01em; }
+h2 { font-size: 1.6rem; margin: 0 0 0.6rem; }
+h3 { font-size: 1.05rem; margin: 0 0 0.35rem; }
+p { margin: 0 0 1rem; }
+section { padding: 56px 0; border-top: 1px solid var(--rule); }
+.lede { font-size: 1.15rem; color: var(--ink-2); max-width: 40em; }
+.kicker { font: 600 0.78rem/1 var(--mono); text-transform: uppercase; letter-spacing: 0.12em; color: var(--accent); margin-bottom: 0.8rem; }
+
+/* hero */
+header { padding: 72px 0 56px; }
+header h1 { font: 700 clamp(2.2rem, 7vw, 3.6rem)/1.05 var(--mono); margin: 0 0 1rem; letter-spacing: -0.03em; }
+header h1 span { color: var(--accent); }
+.hero-line {
+  margin: 28px 0 0;
+  padding: 16px 18px;
+  background: var(--bg-raised);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  font: 0.92rem/1.7 var(--mono);
+  overflow-wrap: anywhere;
+}
+.op { color: var(--accent); font-weight: 700; }
+.mg { color: var(--merge); font-weight: 700; }
+.install { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin-top: 24px; color: var(--ink-3); font-size: 0.9rem; }
+.install pre { margin: 0; min-width: 0; max-width: 100%; }
+
+/* terminal */
+.term {
+  max-width: 100%;
+  background: var(--term-bg);
+  color: var(--term-ink);
+  border-radius: 8px;
+  padding: 16px 18px;
+  font: 0.82rem/1.6 var(--mono);
+  overflow-x: auto;
+  margin: 0 0 1.2rem;
+  white-space: pre;
+}
+.term .p { color: var(--term-dim); user-select: none; }
+.term .d { color: var(--term-dim); }
+.term .a { color: var(--term-accent); }
+.term .ok { color: var(--term-ok); }
+.term .w { color: var(--term-warn); }
+pre.plain { max-width: 100%; background: var(--bg-code); border-radius: 6px; padding: 12px 14px; font-size: 0.85rem; overflow-x: auto; margin: 0 0 1rem; }
+
+/* diagram */
+figure { margin: 0 0 1.4rem; }
+.scroll { overflow-x: auto; }
+.dag { display: block; min-width: 620px; width: 100%; height: auto; }
+.dag .box { fill: var(--bg-raised); stroke: var(--rule); stroke-width: 1.5; }
+.dag .trunk { fill: var(--accent-soft); stroke: var(--accent); }
+.dag text { font: 14px var(--mono); fill: var(--ink); }
+.dag .count { font-size: 11px; fill: var(--ink-3); }
+.dag .stack { stroke: var(--ink-2); stroke-width: 2; fill: none; }
+.dag .merge { stroke: var(--merge); stroke-width: 2; stroke-dasharray: 6 5; fill: none; }
+.dag .head-s { fill: var(--ink-2); }
+.dag .head-m { fill: var(--merge); }
+figcaption { font-size: 0.88rem; color: var(--ink-3); margin-top: 8px; }
+.legend { display: flex; gap: 20px; flex-wrap: wrap; font-size: 0.85rem; color: var(--ink-2); margin-top: 6px; }
+.legend i { display: inline-block; width: 26px; height: 0; vertical-align: middle; margin-right: 6px; border-top: 2px solid var(--ink-2); }
+.legend i.m { border-top: 2px dashed var(--merge); }
+
+/* steps */
+ol.steps { list-style: none; counter-reset: s; padding: 0; margin: 0 0 1.4rem; }
+ol.steps li { counter-increment: s; position: relative; padding: 0 0 14px 44px; }
+ol.steps li::before {
+  content: counter(s);
+  position: absolute; left: 0; top: 0;
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--accent-soft); color: var(--accent);
+  font: 700 0.85rem/28px var(--mono); text-align: center;
+}
+
+/* compare */
+.compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 0 0 1.4rem; }
+.compare > div { min-width: 0; background: var(--bg-raised); border: 1px solid var(--rule); border-radius: 8px; padding: 18px; }
+.compare h3 { font-family: var(--mono); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-3); }
+.compare ul { margin: 0; padding-left: 1.1em; }
+.compare li { margin-bottom: 0.4em; }
+.compare .good h3 { color: var(--ok); }
+
+/* features */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
+.card { background: var(--bg-raised); border: 1px solid var(--rule); border-radius: 8px; padding: 18px; }
+.card p { margin: 0; color: var(--ink-2); font-size: 0.95rem; }
+
+/* syntax table */
+table { width: 100%; border-collapse: collapse; margin: 0 0 1.2rem; font-size: 0.95rem; }
+th, td { text-align: left; vertical-align: top; padding: 10px 12px 10px 0; border-bottom: 1px solid var(--rule); }
+th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-3); font-weight: 600; }
+td:first-child { white-space: nowrap; font-family: var(--mono); font-size: 0.88rem; }
+.cmds td:first-child { white-space: normal; overflow-wrap: anywhere; min-width: 11em; }
+
+footer { padding: 40px 0 64px; border-top: 1px solid var(--rule); color: var(--ink-3); font-size: 0.9rem; }
+
+@media (max-width: 640px) {
+  body { font-size: 16px; }
+  header { padding: 48px 0 40px; }
+  section { padding: 44px 0; }
+  .compare { grid-template-columns: 1fr; }
+  td:first-child { white-space: normal; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="kicker">a git subcommand · one Python file</div>
+    <h1>git <span>merge-stack</span></h1>
+    <p class="lede">Rebase stacks of branches that contain merges. You describe the whole stack in one line, and <code>restack</code> makes the graph match it, across every branch and every worktree, in one go.</p>
+    <div class="hero-line" aria-label="An example stack line">origin/main <span class="op">&gt;</span> feat/search-index <span class="op">&gt;</span> feat/search-ranking <span class="op">;</span> origin/main <span class="op">&gt;</span> feat/plugin-api <span class="mg">+</span> feat/search-index <span class="op">&gt;</span> feat/search-plugin <span class="mg">+</span> feat/search-ranking <span class="op">&gt;</span> fix/search-plugin-ranking</div>
+    <div class="install">
+      <pre class="plain">cp git-merge-stack ~/bin/ &amp;&amp; git merge-stack show</pre>
+      <span>Python 3.11+, stdlib only. git finds it on your <code>PATH</code>.</span>
+    </div>
+  </div>
+</header>
+
+<section id="problem">
+  <div class="wrap">
+    <div class="kicker">the problem</div>
+    <h2>Real stacks aren't a straight line</h2>
+    <p>Stacking tools assume each branch sits on exactly one parent. Real work gets messier than that. Say a notes app is getting full-text search and a plugin API. The search plugin needs both, so it's built on the plugin API and merges in the search index. A fix to it needs the ranking work too, so it merges that in. Then the trunk moves, or a base branch gains a commit, and every branch above has to move with it, merges included.</p>
+    <figure>
+      <div class="scroll">
+        <svg class="dag" viewBox="0 0 930 250" role="img" aria-label="Five branches: feat/search-index and feat/plugin-api sit on origin/main; feat/search-ranking sits on feat/search-index; feat/search-plugin sits on feat/plugin-api and merges feat/search-index; fix/search-plugin-ranking sits on feat/search-plugin and merges feat/search-ranking.">
+          <defs>
+            <marker id="hs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="head-s" d="M0,0 L10,5 L0,10 z"/></marker>
+            <marker id="hm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="head-m" d="M0,0 L10,5 L0,10 z"/></marker>
+          </defs>
+          <!-- stacked-on edges -->
+          <path class="stack" d="M150,113 C175,113 175,55 196,55" marker-end="url(#hs)"/>
+          <path class="stack" d="M150,137 C175,137 175,195 196,195" marker-end="url(#hs)"/>
+          <path class="stack" d="M390,55 L436,55" marker-end="url(#hs)"/>
+          <path class="stack" d="M390,195 L436,195" marker-end="url(#hs)"/>
+          <path class="stack" d="M650,195 L686,195" marker-end="url(#hs)"/>
+          <!-- merged-in edges -->
+          <path class="merge" d="M295,77 C320,130 420,150 466,175" marker-end="url(#hm)"/>
+          <path class="merge" d="M545,77 C570,130 680,150 716,175" marker-end="url(#hm)"/>
+          <!-- boxes -->
+          <rect class="box trunk" x="10" y="103" width="140" height="44" rx="6"/>
+          <text x="80" y="130" text-anchor="middle">origin/main</text>
+          <rect class="box" x="200" y="33" width="190" height="44" rx="6"/>
+          <text x="295" y="55" text-anchor="middle">feat/search-index</text>
+          <text class="count" x="295" y="70" text-anchor="middle">5 commits</text>
+          <rect class="box" x="200" y="173" width="190" height="44" rx="6"/>
+          <text x="295" y="195" text-anchor="middle">feat/plugin-api</text>
+          <text class="count" x="295" y="210" text-anchor="middle">14 commits</text>
+          <rect class="box" x="440" y="33" width="210" height="44" rx="6"/>
+          <text x="545" y="55" text-anchor="middle">feat/search-ranking</text>
+          <text class="count" x="545" y="70" text-anchor="middle">5 commits</text>
+          <rect class="box" x="440" y="173" width="210" height="44" rx="6"/>
+          <text x="545" y="195" text-anchor="middle">feat/search-plugin</text>
+          <text class="count" x="545" y="210" text-anchor="middle">11 commits</text>
+          <rect class="box" x="690" y="173" width="230" height="44" rx="6"/>
+          <text x="805" y="195" text-anchor="middle">fix/search-plugin-ranking</text>
+          <text class="count" x="805" y="210" text-anchor="middle">1 commit</text>
+        </svg>
+      </div>
+      <div class="legend"><span><i></i>stacked on (<code>&gt;</code>)</span><span><i class="m"></i>merged in (<code>+</code>)</span></div>
+      <figcaption>Five branches, two of them built on merges. The line at the top describes exactly this.</figcaption>
+    </figure>
+    <div class="compare">
+      <div>
+        <h3>With plain git</h3>
+        <ul>
+          <li><code>rebase --rebase-merges --update-refs</code> works from one tip, so side branches get left behind.</li>
+          <li>Merges get re-resolved, and an evil merge's extra changes are easy to lose.</li>
+          <li>Each worktree's branch has to be moved by hand.</li>
+          <li>Nothing tells you a branch silently lost a commit.</li>
+        </ul>
+      </div>
+      <div class="good">
+        <h3>With merge-stack</h3>
+        <ul>
+          <li>Write the stack you want as one line. Every branch in it moves.</li>
+          <li>Merges are replayed with their parents; extra changes in a merge are carried forward.</li>
+          <li>Every branch moves in its own worktree, files included.</li>
+          <li>A line that would drop a commit is refused before anything happens.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="story">
+  <div class="wrap">
+    <div class="kicker">one restack</div>
+    <h2>Five branches, four worktrees, one command</h2>
+    <p>A week into that work, the stack has drifted in three ways at once:</p>
+    <ol class="steps">
+      <li><strong><code>main</code> gained autosave</strong>, so <code>feat/search-index</code> and <code>feat/plugin-api</code> sit on an old trunk commit. Autosave also edits the same <code>save()</code> the search index hooks into.</li>
+      <li><strong><code>feat/plugin-api</code> gained a commit</strong>, "load plugins from the user's config dir", after <code>feat/search-plugin</code> was built on it. So <code>feat/search-plugin</code> is now on <code>feat/plugin-api~1</code>.</li>
+      <li><strong>The fix branch couldn't wait for it</strong>, so it cherry-picked its own copy of that commit under its merge. No ref points at the copy, so the only name for its base is a hash.</li>
+    </ol>
+    <p><code>show</code> reads all of that off the graph. <code>2e1f9f590a3e</code> is the old trunk commit, and <code>4e9b8b4d3452</code> is the copy:</p>
+<div class="term" role="region" aria-label="show output before the restack"><span class="p">$ </span>git merge-stack show --all
+2e1f9f590a3e
+├─ feat/search-index          5 commits
+│  └─ feat/search-ranking     5 commits
+└─ feat/plugin-api            14 commits
+   └─ feat/search-plugin      11 commits  on feat/plugin-api~1  + feat/search-index
+4e9b8b4d3452
+└─ fix/search-plugin-ranking  1 commit    + feat/search-ranking
+
+<span class="d">2e1f9f590a3e</span> <span class="a">&gt;</span> feat/search-index <span class="a">&gt;</span> feat/search-ranking <span class="a">;</span> <span class="d">2e1f9f590a3e</span> <span class="a">&gt;</span> feat/plugin-api <span class="a">;</span> feat/plugin-api~1 <span class="a">+</span> feat/search-index <span class="a">&gt;</span> feat/search-plugin <span class="a">;</span> <span class="d">4e9b8b4d3452</span> <span class="a">+</span> feat/search-ranking <span class="a">&gt;</span> fix/search-plugin-ranking</div>
+    <p>The fix is to say where each branch should be. Keep the line in a file, one chain per line:</p>
+<pre class="plain"># stack
+origin/main &gt; feat/search-index &gt; feat/search-ranking
+origin/main &gt; feat/plugin-api + feat/search-index &gt; feat/search-plugin
+feat/search-plugin + feat/search-ranking &gt; fix/search-plugin-ranking</pre>
+    <p>Then run it. The search index's save hook conflicts with autosave, so it stops right there, in the worktree it was run from, the way <code>git rebase</code> does:</p>
+<div class="term" role="region" aria-label="restack output"><span class="p">$ </span>git merge-stack restack -f stack
+<span class="w">conflict: feat/search-index: 398a015dfe92 search: update the index when a note is saved: src/app.ts</span>
+git-merge-stack: stopped at that commit in ~/src/notes-app; no ref was written yet.
+Fix the files there and `git add` them, then:
+  git merge-stack restack --continue    # or --abort to put everything back
+<span class="p">$ </span>$EDITOR src/app.ts &amp;&amp; git add src/app.ts
+<span class="p">$ </span>git merge-stack restack --continue
+<span class="ok">feat/search-index: 231847e474e7 -&gt; 7f0aba147149</span>
+  83856947aca1 -&gt; e7c7ab548786  search: tokenize note text
+  398a015dfe92 -&gt; ce55391f9ff7  search: update the index when a note is saved
+  64f9d3f5d0e5 -&gt; 2806e9b240e8  search: persist the index next to the notes
+  b0c5640c1302 -&gt; 9d8e8289cdd9  search: match terms and phrases
+  231847e474e7 -&gt; 7f0aba147149  search: register the index with the plugin registry
+<span class="ok">feat/plugin-api: 788b83cc25c9 -&gt; d71f17053cdb</span>
+<span class="d">  … 14 commits</span>
+<span class="ok">feat/search-plugin: ef9387f87194 -&gt; 3ab871face44</span>
+  9d35eef4f1ab -&gt; 2b6a484d5be6  Merge feat/search-index into feat/search-plugin
+<span class="d">  … 10 more</span>
+<span class="ok">feat/search-ranking: a95666bd7a39 -&gt; 55534357f0f7</span>
+<span class="d">  … 5 commits</span>
+<span class="ok">fix/search-plugin-ranking: 8f1d863bef82 -&gt; 9ecf76054440</span>
+  8f1d863bef82 -&gt; 9ecf76054440  Merge feat/search-ranking into fix/search-plugin-ranking
+dropped, their patch is already in the new history:
+  fix/search-plugin-ranking: 4e9b8b4d3452 plugin-api: load plugins from the user's config dir
+backups: refs/stack-backup/2026-03-14-161205/</div>
+    <p>All five branches moved, each in its own worktree. The cherry-picked copy was dropped because its patch is already in the new history, through <code>feat/plugin-api</code>. Afterwards <code>show</code> prints exactly the line from the file:</p>
+<div class="term" role="region" aria-label="show output after the restack">origin/main
+├─ feat/search-index                5 commits
+│  └─ feat/search-ranking           5 commits
+└─ feat/plugin-api                  14 commits
+   └─ feat/search-plugin            11 commits  + feat/search-index
+      └─ fix/search-plugin-ranking  1 commit    + feat/search-ranking</div>
+  </div>
+</section>
+
+<section id="line">
+  <div class="wrap">
+    <div class="kicker">the line</div>
+    <h2>Three operators</h2>
+    <p>A line is chains separated by <code>;</code>. Each chain is terms joined by <code>&gt;</code>, and a term is a ref plus any refs merged into it with <code>+</code>. A name in two chains is the same branch. A name never written after <code>&gt;</code> is a fixed point: it's read, never rewritten.</p>
+    <table>
+      <thead><tr><th>write</th><th>means</th></tr></thead>
+      <tbody>
+        <tr><td>a &gt; b</td><td>put <code>b</code>'s own commits on top of <code>a</code></td></tr>
+        <tr><td>a + b &gt; c</td><td>merge <code>b</code> into <code>a</code>, and <code>c</code> starts from that merge (the merge is <code>c</code>'s bottom commit)</td></tr>
+        <tr><td>x ; y</td><td>two chains, restacked together</td></tr>
+        <tr><td>a~2 &gt; b</td><td>keep <code>b</code> on an older commit of <code>a</code></td></tr>
+        <tr><td>a &gt; b:c^..d,e..f</td><td>make <code>b</code> exactly those runs of commits, dropping the rest</td></tr>
+      </tbody>
+    </table>
+    <p><code>+</code> binds tighter than <code>&gt;</code>. In a file, each line is a chain; end a line with an operator to carry the chain onto the next one.</p>
+  </div>
+</section>
+
+<section id="commands">
+  <div class="wrap">
+    <div class="kicker">commands</div>
+    <h2>Show, plan, restack</h2>
+    <table class="cmds">
+      <thead><tr><th>run</th><th>to</th></tr></thead>
+      <tbody>
+        <tr><td>git merge-stack show</td><td>print the stack you're on as a tree and a line, derived from the graph</td></tr>
+        <tr><td>git merge-stack plan -f stack</td><td>replay it in memory and report what moves, every conflict, and any commit it would drop. Writes nothing.</td></tr>
+        <tr><td>git merge-stack restack -f stack</td><td>make the graph match the line (or pass the line as an argument)</td></tr>
+        <tr><td>git merge-stack restack</td><td>with no line: put every branch in your stack onto the current tip of what it's stacked on</td></tr>
+        <tr><td>git merge-stack restack -i</td><td>the same, but open the line in your editor first</td></tr>
+        <tr><td>restack --continue · --abort</td><td>after a conflict: carry on, or put everything back as it was</td></tr>
+        <tr><td>restack --exec 'make test'</td><td>run a check at every moved tip before any ref is written</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="safety">
+  <div class="wrap">
+    <div class="kicker">how it's safe</div>
+    <h2>Nothing moves until everything works</h2>
+    <div class="grid">
+      <div class="card"><h3>In memory first</h3><p>The whole stack is replayed with <code>git merge-tree</code> and <code>git commit-tree</code>. No worktree, index or ref is touched until the replay is done.</p></div>
+      <div class="card"><h3>One transaction</h3><p>Every ref moves in one <code>update-ref</code> transaction, guarded by the old values, with a backup of each under <code>refs/stack-backup/</code>.</p></div>
+      <div class="card"><h3>Refuses to lose commits</h3><p>A line that would drop a commit from a branch is refused up front, unless the commit's patch is already in the new history.</p></div>
+      <div class="card"><h3>Merges keep their changes</h3><p>A merge that changed more than a plain merge would have (an evil merge, or a conflict resolution) has that difference carried forward.</p></div>
+      <div class="card"><h3>Conflicts, like rebase</h3><p>It stops in your worktree with git's usual conflict state. Fix, <code>git add</code>, <code>--continue</code>. rerere is on, so a conflict you've resolved before comes back with your resolution filled in.</p></div>
+      <div class="card"><h3>Every worktree</h3><p>A branch checked out anywhere moves with <code>reset --keep</code> in its own worktree. Local changes in the way stop that branch, loudly.</p></div>
+      <div class="card"><h3>Signed when you sign</h3><p>With <code>commit.gpgsign</code> set, every commit it writes is signed. Commits it reuses keep their own signatures.</p></div>
+      <div class="card"><h3>Upstream hints</h3><p>Commits that look already upstream (same patch, a range-diff pair, or an empty replay) are listed with the line that would drop them. Only listed, never dropped.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <div class="kicker">install</div>
+    <h2>One file on your PATH</h2>
+<pre class="plain">cp git-merge-stack ~/bin/
+git merge-stack show</pre>
+    <p>It needs Python 3.11 or newer and nothing else. It shells out to the git CLI and uses <code>git merge-tree --write-tree</code>, with <code>--merge-base</code>, so it needs git 2.40 or newer. Use <code>git merge-stack -h</code> for help; <code>--help</code> is caught by git, which looks for a man page.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">git merge-stack · rebase stacks that contain merges, described by one line.</div>
+</footer>
+
+</body>
+</html>

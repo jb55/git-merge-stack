@@ -1,0 +1,1755 @@
+#!/usr/bin/env python3
+"""Rebase git stacks that contain merges, described by a one-line syntax.
+
+Copy this file onto PATH and git runs it as `git merge-stack`:
+
+    cp git-merge-stack ~/bin/ && git merge-stack show
+
+Stdlib only; it shells out to the git CLI.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+
+
+# ============================================================================
+# git
+#
+# A thin subprocess wrapper over the git CLI.
+# ============================================================================
+
+class GitError(RuntimeError):
+    pass
+
+
+class Git:
+    def __init__(self, cwd: str = "."):
+        self.cwd = cwd
+
+    def run(self, *args: str, input: str | None = None, check: bool = True, env: dict[str, str] | None = None):
+        p = subprocess.run(
+            ["git", *args], cwd=self.cwd, input=input, capture_output=True, text=True,
+            env={**os.environ, **env} if env else None,
+        )
+        if check and p.returncode:
+            raise GitError(f"git {' '.join(args)}: {p.stderr.strip()}")
+        return p
+
+    def out(self, *args: str, input: str | None = None, env: dict[str, str] | None = None) -> str:
+        return self.run(*args, input=input, env=env).stdout.rstrip("\n")
+
+    def commit(self, rev: str) -> str | None:
+        """The commit `rev` names, or None."""
+        p = self.run("rev-parse", "--verify", "-q", f"{rev}^{{commit}}", check=False)
+        return p.stdout.strip() or None
+
+
+# ============================================================================
+# syntax
+#
+# The one-line stack syntax.
+#
+#     origin/master > search > filters ; api + search > api-search
+#
+#     line  := chain (';' chain)*
+#     chain := term ('>' term)*
+#     term  := ref ('+' ref)*
+#
+# `a > b` puts b's own commits on a. `a + b` merges b into a's tip, and the
+# branch after the next `>` starts from that merge, so the merge is that
+# branch's bottom commit. `+` binds tighter than `>`, and `a + b + c` is two
+# merges, left to right. A name in two chains is the same branch. A name never
+# written after `>` is a fixed point: read, never rewritten.
+#
+# Written over several lines (a file, or restack -i's editor), each line
+# break is a ';' between chains, unless the line before ends with, or the
+# next starts with, '>', '+' or ';': then the chain carries on. Blank lines
+# and '#' lines are dropped.
+#
+# A term may also be a commit range, written only after `>`:
+#
+#     origin/master > a..b + br2 > lane ; api + search > flow:c^..d,e..f
+#
+# `a..b` replays those commits onto the term before it, merges inside the
+# range keeping their shape; what follows builds on its tip. `name:a..b,c..d`
+# makes branch `name` exactly those runs, one after another, dropping its
+# other commits and the gaps between runs. Git refnames can hold neither `..`
+# nor `:`, so neither reads as a branch.
+# ============================================================================
+
+Term = tuple[str, ...]
+Runs = list[tuple[str, str]]
+
+
+class LineError(ValueError):
+    pass
+
+
+def parse(line: str) -> list[list[Term]]:
+    """Split a line into chains of terms, each term a base and its merges."""
+    chains = []
+    for chain in line.split(";"):
+        if not chain.strip():
+            raise LineError(f"empty chain in {line.strip()!r}")
+        terms = []
+        for term in chain.split(">"):
+            refs = tuple(r.strip() for r in term.split("+"))
+            for ref in refs:
+                if not ref:
+                    raise LineError(f"empty ref in {chain.strip()!r}")
+                if any(c.isspace() for c in ref):
+                    raise LineError(f"missing '>' or '+' in {ref!r}")
+                if "..." in ref:
+                    raise LineError(f"{ref!r}: '...' has no replay order; use '..'")
+            for ref in refs[1:]:
+                if is_range(ref):
+                    raise LineError(f"{ref!r} after '+': a merge takes one tip, not a range")
+            terms.append(refs)
+        chains.append(terms)
+    return chains
+
+
+def join_lines(text: str) -> str:
+    """Several lines as one line: chains a line apart, a '#' line dropped."""
+    out = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        glue = " " if not out or out[-1] in ">+;" or line[0] in ">+;" else " ; "
+        out += (glue if out else "") + line
+    return out
+
+
+def is_range(ref: str) -> bool:
+    return ".." in ref or ":" in ref
+
+
+def split_range(ref: str) -> tuple[str, Runs]:
+    """`name:a..b,c..d` -> (name, [(a, b), (c, d)]); an unnamed range is named by itself."""
+    name, colon, spec = ref.rpartition(":")
+    if colon and (not name or ref_name(name) != name or ".." in name):
+        raise LineError(f"{ref!r}: only a branch name can come before ':'")
+    runs = []
+    for run in spec.split(","):
+        lo, dots, hi = run.partition("..")
+        if not dots or not lo or not hi or ".." in hi:
+            raise LineError(f"{ref!r}: each run must be 'from..to'")
+        runs.append((lo, hi))
+    return name or ref, runs
+
+
+def stack(line: str) -> dict[str, Term]:
+    """Map each branch written after `>` to the term it sits on."""
+    return read(line)[0]
+
+
+def read(line: str) -> tuple[dict[str, Term], dict[str, Runs]]:
+    """`stack`, plus the runs of every range: a named one under its branch,
+    an unnamed one under its own text, which the terms above it name it by."""
+    parents: dict[str, Term] = {}
+    ranges: dict[str, Runs] = {}
+    for terms in parse(line):
+        if len(terms) == 1:
+            raise LineError(f"{format_term(terms[0])!r} stacks nothing; use '>'")
+        if is_range(terms[0][0]):
+            raise LineError(f"{terms[0][0]!r} has no term below it to be replayed onto")
+        if len(terms[-1]) > 1:
+            raise LineError(
+                f"{format_term(terms[-1])!r} merges into "
+                f"{terms[-1][0]!r} with nothing stacked on it"
+            )
+        if ":" not in terms[-1][0] and is_range(terms[-1][0]):
+            raise LineError(f"{terms[-1][0]!r} has nothing stacked on it; bind it to a branch with 'name:'")
+        for i, term in enumerate(terms):
+            if is_range(term[0]):
+                name, runs = split_range(term[0])
+                if ranges.get(name, runs) != runs:
+                    raise LineError(f"{name!r} is given two different ranges")
+                ranges[name] = runs
+                terms[i] = (name, *term[1:])
+        for below, term in zip(terms, terms[1:]):
+            branch = term[0]
+            if branch not in ranges and ref_name(branch) != branch:
+                raise LineError(f"{branch!r} is stacked on, so it must be a branch name")
+            if parents.get(branch, below) != below:
+                raise LineError(
+                    f"{branch!r} is stacked on both {format_term(parents[branch])!r}"
+                    f" and {format_term(below)!r}"
+                )
+            parents[branch] = below
+    topo_order(parents)  # rejects cycles
+    return parents, ranges
+
+
+def ref_name(ref: str) -> str:
+    """The name part of a ref expression: `search~2` -> `search`. A range is its own name."""
+    if is_range(ref):
+        return ref
+    return re.split(r"[~^]", ref, maxsplit=1)[0]
+
+
+def format_term(term: Term) -> str:
+    return " + ".join(term)
+
+
+def topo_order(parents: dict[str, Term]) -> list[str]:
+    """Branches below the ones built on them; ties go to the most depended-on."""
+    deps = {b: {ref_name(r) for r in t} & parents.keys() - {b} for b, t in parents.items()}
+    users: dict[str, set[str]] = {b: set() for b in parents}
+    for b, ds in deps.items():
+        for d in ds:
+            users[d].add(b)
+
+    def reach(b: str, seen: set[str]) -> set[str]:
+        for u in users[b] - seen:
+            seen.add(u)
+            reach(u, seen)
+        return seen
+
+    weight = {b: len(reach(b, set())) for b in parents}
+    order: list[str] = []
+    pending = dict(deps)
+    while pending:
+        ready = [b for b, ds in pending.items() if not ds - set(order)]
+        if not ready:
+            raise LineError(f"cycle between {', '.join(sorted(pending))}")
+        b = min(ready, key=lambda b: (-weight[b], b))
+        order.append(b)
+        del pending[b]
+    return order
+
+
+def format_line(parents: dict[str, Term]) -> str:
+    """Print a stack as chains, each running as far up as `>` alone reaches."""
+    order = topo_order(parents)
+    done: set[str] = set()
+    chains = []
+    for b in order:
+        if b in done:
+            continue
+        done.add(b)
+        parts = [format_term(parents[b]), b]
+        while nxt := next((c for c in order if c not in done and parents[c][0] == b), None):
+            done.add(nxt)
+            parts[-1] = format_term(parents[nxt])
+            parts.append(nxt)
+            b = nxt
+        chains.append(" > ".join(parts))
+    return " ; ".join(chains)
+
+
+# ============================================================================
+# graph
+#
+# Derive a stack line from the commit graph.
+#
+# Every commit not on the trunk is a stack commit. A branch owns the stack
+# commits on its first-parent chain down to the first one that something else
+# claims: the tip of another ref, a commit on the chain of a ref that forks
+# from it, the base `show` recorded for it, or the trunk. Merges may only sit
+# at the bottom of a branch, where they become the `+` refs of its term.
+# ============================================================================
+
+BASE_RECORDS = "refs/stack/base/"
+TRUNK_GUESSES = (
+    "refs/remotes/origin/main",
+    "refs/remotes/origin/master",
+    "refs/heads/main",
+    "refs/heads/master",
+)
+# Which name wins when several refs point at one commit.
+KINDS = {"local": 0, "remote": 1, "tag": 2}
+
+
+class StackError(RuntimeError):
+    pass
+
+
+@dataclass
+class Branch:
+    name: str
+    tip: str
+    own: list[str]  # newest first; merges, if any, at the bottom
+    base: str  # the commit the bottom sits on
+    term: Term  # names: the base, then each merged ref, oldest merge first
+    warnings: list[str] = field(default_factory=list)
+    tied: str | None = None  # the branch given the commits below an equal fork
+
+
+class Graph:
+    """The stack-relevant slice of a repo: every commit not on the trunk."""
+
+    def __init__(self, git: Git, trunk: str | None = None):
+        self.git = git
+        self.refs, upstreams = self._read_refs()
+        self.trunk, self.trunk_commit = self._trunk(trunk)
+        self.locals = {
+            full.removeprefix("refs/heads/"): c
+            for full, c in self.refs.items()
+            if full.startswith("refs/heads/") and full != self.trunk
+        }
+        # Refs that can own commits or name them. A remote branch that shadows
+        # a local one is the local branch's old copy, so it names nothing.
+        self.kind: dict[str, str] = {}
+        self.tip: dict[str, str] = {}
+        for full, c in self.refs.items():
+            if full == self.trunk:
+                continue
+            if full.startswith("refs/heads/"):
+                name, kind = full.removeprefix("refs/heads/"), "local"
+            elif full.startswith("refs/remotes/"):
+                name, kind = full.removeprefix("refs/remotes/"), "remote"
+                rest = name.split("/", 1)[-1]
+                if rest == "HEAD" or rest in self.locals or full in upstreams:
+                    continue
+            elif full.startswith("refs/tags/"):
+                name, kind = full.removeprefix("refs/tags/"), "tag"
+            else:
+                continue
+            if name not in self.tip:
+                self.tip[name], self.kind[name] = c, kind
+
+        self.parents = self._stack_commits()
+        self.selected = sorted(b for b, c in self.locals.items() if c in self.parents)
+
+        self.chain: dict[str, dict[str, int]] = {}
+        self.on: dict[str, list[tuple[str, int]]] = defaultdict(list)
+        self.merge_at: dict[str, int] = {}  # each ref's first merge down its chain
+        for name, tip in self.tip.items():
+            chain: dict[str, int] = {}
+            x = tip
+            while x in self.parents and x not in chain:
+                self.on[x].append((name, len(chain)))
+                if len(self.parents[x]) == 2:
+                    self.merge_at.setdefault(name, len(chain))
+                chain[x] = len(chain)
+                x = self.parents[x][0] if self.parents[x] else None
+            self.chain[name] = chain
+
+        self._was: dict[str, set[str]] = {}  # each branch's former tips, from its reflog
+        self.tips_at: dict[str, list[str]] = defaultdict(list)
+        for name in sorted(self.tip, key=lambda n: (KINDS[self.kind[n]], n)):
+            self.tips_at[self.tip[name]].append(name)
+        self.tips_at[self.trunk_commit].insert(0, short(self.trunk))
+
+    def _read_refs(self) -> tuple[dict[str, str], set[str]]:
+        fmt = "%00".join(
+            ["%(refname)", "%(objecttype)", "%(objectname)", "%(*objecttype)",
+             "%(*objectname)", "%(upstream)"]
+        )
+        refs, upstreams = {}, set()
+        for line in self.git.out("for-each-ref", f"--format={fmt}").splitlines():
+            full, kind, oid, peeled_kind, peeled, upstream = line.split("\0")
+            if upstream:
+                upstreams.add(upstream)
+            if kind == "commit":
+                refs[full] = oid
+            elif peeled_kind == "commit":
+                refs[full] = peeled
+        return refs, upstreams
+
+    def _trunk(self, trunk: str | None) -> tuple[str, str]:
+        if trunk:
+            for full in (trunk, f"refs/heads/{trunk}", f"refs/remotes/{trunk}", f"refs/tags/{trunk}"):
+                if full in self.refs:
+                    return full, self.refs[full]
+            if c := self.git.commit(trunk):
+                return trunk, c
+            raise StackError(f"unknown trunk {trunk!r}")
+        head = self.git.run("symbolic-ref", "-q", "refs/remotes/origin/HEAD", check=False)
+        for full in (head.stdout.strip(), *TRUNK_GUESSES):
+            if full in self.refs:
+                return full, self.refs[full]
+        raise StackError("no trunk found (origin/HEAD, origin/main, origin/master, main, master); pass --trunk")
+
+    def _stack_commits(self) -> dict[str, list[str]]:
+        """Parents of every commit reachable from a ref but not from the trunk."""
+        tips = sorted(set(self.tip.values()))
+        if not tips:
+            return {}
+        out = self.git.out(
+            "rev-list", "--parents", "--stdin", input="\n".join([*tips, "^" + self.trunk_commit]) + "\n"
+        )
+        return {c: ps for c, *ps in (line.split() for line in out.splitlines())}
+
+    def resolve_branch(self, token: str) -> str:
+        """A local branch by exact name, else by unique suffix."""
+        if token in self.locals:
+            return token
+        matches = sorted(b for b in self.locals if b.endswith(token))
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise StackError(f"{token!r} matches several branches: {', '.join(matches)}")
+        raise StackError(f"no local branch matches {token!r}")
+
+    def above(self, r: str, q: str) -> bool:
+        """Whether r is stacked on q: q's tip is a strict first-parent ancestor of r's."""
+        return self.tip[q] in self.chain[r] and self.tip[q] != self.tip[r]
+
+    def owner(self, x: str) -> tuple[str, str | None]:
+        """The ref a stack commit belongs to: the lowest ref whose chain holds it.
+
+        At a fork, where two refs continue from x and neither is stacked on
+        the other, a ref whose arm runs through a merge loses, since merges
+        sit at the bottom and what's under one is its base. Then a branch
+        that held x before wins (see `held`), so one grown at its tip keeps
+        its commits. Then a local branch beats a remote one, then the longer
+        arm wins. When the arms tie, the graph can't tell, so the runner-up
+        comes back too, for a warning.
+        """
+        on = dict(self.on[x])
+        low = [r for r in on if not any(self.above(r, q) for q in on if q != r)]
+        held = {r for r in low if len(low) > 1 and self.held(r, x, low)}
+        rank = sorted(low, key=lambda r: (on[r] > self.merge_at.get(r, on[r]), r not in held, self.kind[r] != "local", -on[r], r))
+        key = lambda r: (on[r] > self.merge_at.get(r, on[r]), r not in held, self.kind[r], on[r])
+        tied = rank[1] if len(rank) > 1 and key(rank[0]) == key(rank[1]) else None
+        return rank[0], tied
+
+    def held(self, r: str, x: str, arms: list[str]) -> bool:
+        """Whether branch r's reflog has a tip at or above x on the chain the
+        arms share: r held x before the arms forked, so it's r's. The entry
+        that created a branch doesn't count; a branch made at a fork
+        holds nothing there yet."""
+        if r not in self._was:
+            p = self.git.run("reflog", "show", "--format=%H %gs", f"refs/heads/{r}", check=False)
+            self._was[r] = {
+                c for c, _, msg in (line.partition(" ") for line in p.stdout.splitlines())
+                if not msg.startswith("branch: Created from")
+            } if self.kind[r] == "local" and not p.returncode else set()
+        chain = self.chain[r]
+        return any(
+            t in chain and chain[t] <= chain[x] and all(t in self.chain[q] for q in arms)
+            for t in self._was[r]
+        )
+
+    def name(self, x: str, b: str) -> str:
+        """How b's term names commit x: a ref, a ref~N, or a short hash."""
+        for n in self.tips_at.get(x, ()):
+            if n != b:
+                return n
+        tip = self.locals[b]
+        on = [(r, n) for r, n in self.on.get(x, ()) if r != b and tip not in self.chain[r]]
+        if on:
+            owner, _ = self.owner(x)
+            r, n = min(on, key=lambda rn: (rn[0] != owner, KINDS[self.kind[rn[0]]], rn[1], rn[0]))
+            return f"{r}~{n}"
+        return x[:12]
+
+    def derive(self, b: str) -> Branch:
+        tip = self.locals[b]
+        if tip not in self.parents:
+            return Branch(b, tip, [], tip, (self.name(tip, b),))
+        twins = [r for r in self.tips_at[tip] if r < b and self.kind[r] == "local"]
+        if twins:
+            return Branch(b, tip, [], tip, (twins[0],))
+
+        record = self.refs.get(BASE_RECORDS + b)
+        own: list[str] = []
+        warnings = []
+        tied_with = None
+        x = tip
+        while True:
+            own.append(x)
+            ps = self.parents[x]
+            if len(ps) > 2:
+                raise StackError(f"{b}: octopus merge {x[:12]} is not supported")
+            if not ps:
+                raise StackError(f"{b}: reaches a root commit without meeting {short(self.trunk)}")
+            x = ps[0]
+            if x not in self.parents or x == record or self.tips_at.get(x):
+                break
+            owner, tied = self.owner(x)
+            if owner != b:
+                if tied == b:
+                    tied_with = owner
+                    warnings.append(
+                        f"{b}: {owner} and {tied} fork equally at {x[:12]};"
+                        f" read as {owner}'s commits"
+                    )
+                break
+            if len(ps) == 2 and len(self.parents[x]) != 2:
+                # Merges sit at the bottom, so the first commit below one is the base.
+                if self.name(x, b) == x[:12]:
+                    warnings.append(
+                        f"{b}: commits below its merge {own[-1][:12]} read as its base;"
+                        f" put a branch at {x[:12]} to stack them"
+                    )
+                break
+
+        merges = [c for c in reversed(own) if len(self.parents[c]) == 2]
+        base = x[:12] if x == record else self.name(x, b)
+        term = (base, *(self.name(self.parents[m][1], b) for m in merges))
+        return Branch(b, tip, own, x, term, warnings, tied_with)
+
+    def head(self) -> tuple[str | None, str | None]:
+        """HEAD's stack branch, or why it has none."""
+        full = self.git.run("symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
+        if not full:
+            return None, "HEAD is detached"
+        if full == self.trunk:
+            return None, "HEAD is on the trunk"
+        b = full.removeprefix("refs/heads/")
+        if b not in self.selected:
+            return None, f"{b} has no commits off {short(self.trunk)}"
+        return b, None
+
+    def show(
+        self, branches: list[str] | None = None, record: bool = True, expand: bool = False
+    ) -> tuple[dict[str, Branch], list[str]]:
+        """The given branches (default: every stack branch) derived, and warnings.
+        Their terms are the line: `format_line` prints it and `tree` draws it.
+
+        With expand, the line holds what a restack of it could move (see
+        stack_of). Every branch is still derived, so ownership and naming
+        don't change; only the printed set is filtered.
+
+        A base that only a hash can name is recorded under refs/stack/base/,
+        so the fork point survives the trunk being rewritten under it.
+        """
+        names = [self.resolve_branch(t) for t in branches] if branches else self.selected
+        if not names:
+            raise StackError(f"no branches with commits off {short(self.trunk)}")
+        if expand:
+            every = {b: self.derive(b) for b in sorted({*self.selected, *names})}
+            terms = {b: d.term for b, d in every.items()}
+            names = stack_of(names, terms)
+            derived = {b: every[b] for b in names}
+        else:
+            derived = {b: self.derive(b) for b in names}
+        if record:
+            for d in derived.values():
+                if d.term[0] == d.base[:12] and self.refs.get(BASE_RECORDS + d.name) != d.base:
+                    self.git.run("update-ref", BASE_RECORDS + d.name, d.base)
+        warnings = [w for d in derived.values() for w in d.warnings]
+        return derived, warnings
+
+
+def reach(start: set[str], links: dict[str, set[str]]) -> set[str]:
+    seen, todo = set(start), list(start)
+    while todo:
+        for n in links[todo.pop()] - seen:
+            seen.add(n)
+            todo.append(n)
+    return seen
+
+
+def stack_of(names: list[str], terms: dict[str, Term]) -> list[str]:
+    """What a restack of names' line could move: down(names) and up(down(names)).
+
+    Down is each name and every branch its term names, recursively, through
+    the base, `+` merges and `~N`. Up is every branch stacked on one of
+    those, recursively. A branch up there that merges in something outside
+    the set keeps it as a name in its term, not as a chain of its own.
+    """
+    names_in = {b: {ref_name(r) for r in t} & terms.keys() - {b} for b, t in terms.items()}
+    users: dict[str, set[str]] = {b: set() for b in terms}
+    for b, ns in names_in.items():
+        for n in ns:
+            users[n].add(b)
+    return sorted(reach(reach(set(names), names_in), users))
+
+
+def short(full: str) -> str:
+    for prefix in ("refs/heads/", "refs/remotes/", "refs/tags/"):
+        if full.startswith(prefix):
+            return full.removeprefix(prefix)
+    return full
+
+
+# ============================================================================
+# replay
+#
+# Replay a stack line in memory.
+#
+# Every commit is rebuilt with plumbing alone, `git merge-tree --write-tree`
+# and `git commit-tree`, so no worktree, index or ref is touched. `plan` reads
+# the result; `restack` writes it.
+#
+# The stack is the derived old one with the line laid over it: a branch the
+# line writes takes the line's term, every other stack branch keeps the term
+# `show` would print, so whatever sits above a moved branch moves with it.
+# Each token is resolved against the old graph and then mapped: a stack branch
+# named bare follows to its new tip, anything else (`ref~N`, a hash, a fixed
+# ref) goes through the old->new commit map.
+#
+# A range term replays its commits as a graph: a first parent outside the
+# range becomes the term below (rebase-cousins), any other outside parent
+# goes through the map. A named range is its branch's new regular commits;
+# an unnamed one is a nameless branch, keyed by its own text.
+#
+# `restack` pins the commit date, so replaying a line twice gives the same
+# hashes, and hands in the trees resolved for earlier conflicts, keyed by
+# `Conflict.key`: a rerun takes those trees in place of merge-tree's.
+# ============================================================================
+
+AUTHOR = re.compile(r"(.*) <(.*)> (\d+) ([+-]\d{4})$")
+
+
+@dataclass
+class Conflict:
+    branch: str
+    commit: str  # the old commit whose replay conflicted; None for a new merge
+    title: str
+    files: list[str]
+    parents: list[str]  # the new parents: [onto] for a pick, [ours, theirs] for a merge
+    token: str = ""  # the merged ref, for a new merge
+
+    @property
+    def key(self) -> str:
+        """What a resolution is filed under: the old commit, or the branch and its merged ref."""
+        return self.commit or f"{self.branch}+{self.token}"
+
+    def __str__(self) -> str:
+        at = self.commit[:12] if self.commit else "new merge"
+        return f"{self.branch}: {at} {self.title}: {', '.join(self.files)}"
+
+
+@dataclass
+class Ref:
+    token: str
+    old: str  # the commit it names in the old graph
+    branch: str | None = None  # the stack branch it names, bare or as branch~N
+    follow: bool = False  # a bare stack branch: maps to that branch's new tip
+
+
+@dataclass
+class Commit:
+    tree: str
+    parents: list[str]
+    author: str
+    message: str
+
+    @property
+    def title(self) -> str:
+        return self.message.split("\n", 1)[0]
+
+
+class Replay:
+    def __init__(
+        self, graph: Graph, line: str,
+        resolved: dict[str, str] | None = None, date: int | None = None,
+    ):
+        self.g = graph
+        self.git: Git = graph.git
+        self.resolved = resolved or {}
+        self.date = date
+        self.warnings: list[str] = []
+        self.conflicts: list[Conflict] = []
+        self.map: dict[str, str] = {}  # old commit -> new, for every own commit replayed
+        self.new_tip: dict[str, str] = {}
+        self.new_base: dict[str, str] = {}
+        self.below: dict[str, str] = {}  # the new commit a branch's regular commits sit on
+        self._commits: dict[str, Commit] = {}
+        self._refs: dict[str, Ref] = {}
+
+        written, ranges = self._written(line)
+        self.written = set(written)
+        self.branches = sorted({*graph.selected, *(b for b in written if b in graph.locals)})
+        derived = {b: graph.derive(b) for b in self.branches}
+        self.old_tip = {b: d.tip for b, d in derived.items()}
+        self.own = {b: list(d.own) for b, d in derived.items()}
+        self.base = {b: d.base for b, d in derived.items()}
+        self.term: dict[str, Term] = {b: d.term for b, d in derived.items()}
+        # Each range's runs as old commits, oldest first, with their parents.
+        self.ranges = {k: self._runs(k, runs) for k, runs in ranges.items()}
+        for k in self.ranges.keys() - self.own.keys():
+            self.own[k] = []
+        # Own commits a named range leaves out: the line drops them on purpose.
+        kept = {c for runs in self.ranges.values() for run in runs for c in run}
+        self.dropping = {
+            c for b in self.ranges for c in self.own[b]
+            if len(self.g.parents[c]) < 2 and c not in kept
+        }
+
+        for b, term in written.items():
+            for r in map(self._resolve, term):
+                if r.branch and not r.follow:
+                    self._claim(r.branch, r.old)
+            # `x > b` settles a fork the graph can't: b's commits that sit on
+            # x's own chain are x's, however long b's arm past them is.
+            base = self._resolve(term[0])
+            if base.follow and base.branch in self.g.chain and b in self.own:
+                on_x = [c for c in self.own[b] if c in self.g.chain[base.branch]]
+                if on_x:
+                    self._claim(base.branch, on_x[-1])
+        self.term.update(written)
+        self.order = self._order()
+
+    def run(self) -> "Replay":
+        for b in self.order:
+            self._branch(b)
+        return self
+
+    # -- reading the line ------------------------------------------------
+
+    def _written(self, line: str) -> tuple[dict[str, Term], dict[str, Runs]]:
+        parents, ranges = read(line)
+        written: dict[str, Term] = {}
+        named: dict[str, Runs] = {}
+        for token, term in parents.items():
+            b = token if is_range(token) else self.g.resolve_branch(token)
+            if token in ranges:
+                named[b] = ranges[token]
+            if written.get(b, term) != term:
+                raise StackError(
+                    f"{b} is stacked on both {format_term(written[b])!r} and {format_term(term)!r}"
+                )
+            written[b] = term
+        return written, named
+
+    def _runs(self, key: str, runs: Runs) -> list[list[str]]:
+        out = []
+        for lo, hi in runs:
+            lo_c, hi_c = self._resolve(lo).old, self._resolve(hi).old
+            commits = self.git.out("rev-list", "--topo-order", "--reverse", hi_c, f"^{lo_c}").split()
+            if not commits:
+                raise StackError(f"{key}: {lo}..{hi} holds no commits")
+            if commits[-1] != hi_c:
+                raise StackError(f"{key}: {lo}..{hi} doesn't end at {hi}")
+            for c in commits:
+                if len(self.commit(c).parents) > 2:
+                    raise StackError(f"{key}: octopus merge {c[:12]} is not supported")
+            out.append(commits)
+        return out
+
+    def _resolve(self, token: str) -> Ref:
+        """A token against the old graph: a stack branch, or a fixed commit."""
+        if token in self._refs:
+            return self._refs[token]
+        if token in self.own and token not in self.g.locals:  # an unnamed range
+            return Ref(token, "", token, follow=True)
+        name = ref_name(token)
+        full = token
+        if name not in self.g.locals and not self.git.commit(token):
+            name = self.g.resolve_branch(name)
+            full = name + token[len(ref_name(token)):]
+        old = self.git.commit(full)
+        if not old:
+            raise StackError(f"unknown ref {token!r}")
+        if name in self.own:
+            r = Ref(token, old, name, follow=full == name)
+        else:
+            r = Ref(token, old)
+        self._refs[token] = r
+        return r
+
+    def _owner(self, c: str) -> str | None:
+        return next((b for b, own in self.own.items() if c in own), None)
+
+    def _claim(self, x: str, c: str):
+        """`x~N` in the line makes x own its chain down to that commit.
+
+        At an equal fork `show` may have given the commits below it to the
+        other branch. Claiming moves them, and that branch's merges, to x;
+        the other branch then sits on x~N at the fork.
+        """
+        while c not in self.own[x] and c in self.g.chain[x]:
+            fork = self.base[x]
+            y = self._owner(fork)
+            if y is None:
+                return
+            if any(len(self.g.parents[o]) == 2 for o in self.own[x]):
+                raise StackError(f"{x} can't claim {c[:12]}: its own commits end in a merge")
+            i = self.own[y].index(fork)
+            self.own[x] += self.own[y][i:]
+            del self.own[y][i:]
+            self.base[x], self.term[x] = self.base[y], self.term[y]
+            self.base[y], self.term[y] = fork, (f"{x}~{self.g.chain[x][fork]}",)
+
+    def _order(self) -> list[str]:
+        owner = {c: b for b, own in self.own.items() for c in own}
+        deps: dict[str, tuple[str, ...]] = {}
+        for b, term in self.term.items():
+            ds = set()
+            for r in map(self._resolve, term):
+                d = r.branch if r.follow else owner.get(r.old)
+                if d == b:
+                    raise StackError(f"{b} is stacked on its own commit {r.token!r}")
+                if d:
+                    ds.add(d)
+            deps[b] = tuple(sorted(ds))
+        return topo_order(deps)
+
+    # -- replaying -------------------------------------------------------
+
+    def _new(self, r: Ref) -> str:
+        return self.new_tip[r.branch] if r.follow else self.map.get(r.old, r.old)
+
+    def _branch(self, b: str):
+        refs = [self._resolve(t) for t in self.term[b]]
+        own = self.own[b][::-1]  # oldest first: merges, then the regular commits
+        merges = [c for c in own if len(self.g.parents[c]) == 2]
+        cur = self.new_base[b] = self._new(refs[0])
+        for i, r in enumerate(refs[1:]):
+            old = merges[i] if i < len(merges) else None
+            cur = self._merge(b, old, cur, self._new(r), r.token)
+        self.below[b] = cur
+        kept = {c for run in self.ranges.get(b, ()) for c in run}
+        for m in merges[len(refs) - 1:]:
+            if m not in kept and self.merge_tree(*self.g.parents[m])[0] != self.commit(m).tree:
+                self.warnings.append(
+                    f"{b}: dropping merge {m[:12]} loses changes a plain merge wouldn't make"
+                )
+        if b in self.ranges:
+            for run in self.ranges[b]:
+                cur = self._run(b, run, cur)
+        else:
+            for c in own[len(merges):]:
+                cur = self._pick(b, c, cur)
+        self.new_tip[b] = cur
+
+    def _run(self, b: str, run: list[str], onto: str) -> str:
+        """Replay one run as a graph onto `onto`, returning its new tip."""
+        new: dict[str, str] = {}
+        for c in run:
+            first, *rest = self.commit(c).parents
+            ps = [new.get(first, onto), *(new.get(p) or self.map.get(p, p) for p in rest)]
+            if rest:
+                new[c] = self._merge(b, c, *ps, rest[0][:12])
+            else:
+                new[c] = self._pick(b, c, ps[0])
+        return new[run[-1]]
+
+    def _pick(self, b: str, c: str, onto: str) -> str:
+        parent = self.commit(c).parents[0]
+        if onto == parent:
+            new = c
+        else:
+            if c in self.resolved:
+                tree, files = self.resolved[c], []
+            else:
+                tree, files = self.merge_tree(onto, c, base=parent)
+            if files:
+                self._conflict(Conflict(b, c, self.commit(c).title, files, [onto]))
+            new = self._write(c, tree, [onto])
+        self.map[c] = new
+        return new
+
+    def _merge(self, b: str, old: str | None, p1: str, p2: str, token: str) -> str:
+        if old and self.commit(old).parents == [p1, p2]:
+            self.map[old] = old
+            return old
+        key = old or f"{b}+{token}"
+        if key in self.resolved:
+            tree, files = self.resolved[key], []
+        else:
+            tree, files = self._merged(b, old, p1, p2)
+        if files:
+            title = self.commit(old).title if old else f"merge {token}"
+            self._conflict(Conflict(b, old, title, files, [p1, p2], token))
+        if old:
+            new = self._write(old, tree, [p1, p2])
+            self.map[old] = new
+            return new
+        return self._write(None, tree, [p1, p2], f"Merge {token} into {b}\n")
+
+    def _merged(self, b: str, old: str | None, p1: str, p2: str) -> tuple[str, list[str]]:
+        tree, files = self.merge_tree(p1, p2)
+        if old:
+            plain, old_files = self.merge_tree(*self.commit(old).parents)
+            kept = self.commit(old).tree
+            if plain != kept:
+                # Carry what the old merge added over a plain merge of its
+                # parents onto the plain merge of the new ones.
+                tree, carried = self.merge_tree(tree, kept, base=plain)
+                files = sorted({*files, *carried})
+                if not old_files:
+                    self.warnings.append(
+                        f"{b}: merge {old[:12]} differs from a plain merge of its parents;"
+                        " carried the difference forward (it probably belongs in a side commit)"
+                    )
+        return tree, files
+
+    def _conflict(self, conflict: Conflict):
+        self.conflicts.append(conflict)
+
+    # -- plumbing --------------------------------------------------------
+
+    def merge_tree(self, ours: str, theirs: str, base: str | None = None) -> tuple[str, list[str]]:
+        """The merged tree, and the conflicted files (merge-tree's tree keeps the markers)."""
+        args = ["merge-tree", "--write-tree", "--name-only", "--no-messages"]
+        if base:
+            args.append(f"--merge-base={base}")
+        p = self.git.run(*args, ours, theirs, check=False)
+        if p.returncode not in (0, 1):
+            raise GitError(f"git {' '.join(args)} {ours} {theirs}: {p.stderr.strip()}")
+        tree, *files = [line for line in p.stdout.split("\n") if line]
+        return tree, files if p.returncode else []
+
+    def commit(self, c: str) -> Commit:
+        if c not in self._commits:
+            raw = self.git.run("cat-file", "commit", c).stdout
+            head, _, message = raw.partition("\n\n")
+            fields: dict[str, list[str]] = {}
+            for line in head.split("\n"):
+                key, _, value = line.partition(" ")
+                fields.setdefault(key, []).append(value)
+            self._commits[c] = Commit(
+                fields["tree"][0], fields.get("parent", []), fields["author"][0], message
+            )
+        return self._commits[c]
+
+    def _write(self, old: str | None, tree: str, parents: list[str], message: str | None = None) -> str:
+        """commit-tree with the old commit's author and message, kept exactly."""
+        env = {}
+        if self.date is not None:
+            env["GIT_COMMITTER_DATE"] = env["GIT_AUTHOR_DATE"] = f"@{self.date} +0000"
+        if old:
+            info = self.commit(old)
+            message = info.message
+            if m := AUTHOR.match(info.author):
+                env |= {
+                    "GIT_AUTHOR_NAME": m[1],
+                    "GIT_AUTHOR_EMAIL": m[2],
+                    "GIT_AUTHOR_DATE": f"@{m[3]} {m[4]}",
+                }
+        args = [x for p in parents for x in ("-p", p)]
+        return self.git.out("commit-tree", tree, *args, "-F", "-", input=message, env=env or None)
+
+    # -- reading the result ----------------------------------------------
+
+    def moved(self) -> list[str]:
+        return [b for b in self.order if b in self.old_tip and self.new_tip[b] != self.old_tip[b]]
+
+    def regular(self, b: str) -> list[str]:
+        """b's old non-merge commits that its new history replays, oldest first."""
+        if b in self.ranges:
+            cs = [c for run in self.ranges[b] for c in run]
+        else:
+            cs = self.own[b][::-1]
+        return [c for c in cs if len(self.commit(c).parents) < 2]
+
+    def moves(self, b: str) -> list[tuple[str, str, str]]:
+        """(old, new, title) for each of b's own commits that changed, oldest first."""
+        return [
+            (c, self.map[c], self.commit(c).title)
+            for c in self.own[b][::-1]
+            if c in self.map and self.map[c] != c
+        ]
+
+
+# ============================================================================
+# restack
+#
+# Write a replayed stack: one ref transaction, backups, and worktree resets.
+# ============================================================================
+
+BACKUPS = "refs/stack-backup/"
+
+
+@dataclass
+class Written:
+    backup: str  # the refs/stack-backup/<stamp>/ prefix
+    moved: list[str] = field(default_factory=list)
+    # A checked-out branch `git reset --keep` refused to move: (branch, worktree, why).
+    failed: list[tuple[str, str, str]] = field(default_factory=list)
+
+
+def dropped(rp: Replay) -> tuple[list[str], list[str]]:
+    """Each stack commit a moving branch had that its new history lacks,
+    save those a named range leaves out on purpose: the ones that would be
+    lost, and the ones whose patch the new history already holds (`git
+    cherry`), which lose nothing."""
+    g, lost, held = rp.g, [], []
+    for b in rp.moved():
+        x, tip = rp.old_tip[b], rp.new_tip[b]
+        while x in g.parents:
+            new = rp.map.get(x, x)
+            if x not in rp.dropping and g.git.run("merge-base", "--is-ancestor", new, tip, check=False).returncode:
+                d = f"{b}: {x[:12]} {rp.commit(x).title}"
+                same = len(g.parents[x]) == 1 and g.git.out("cherry", tip, x, g.parents[x][0]).startswith("-")
+                (held if same else lost).append(d)
+            x = g.parents[x][0] if g.parents[x] else None
+    return lost, held
+
+
+def sign(rp: Replay):
+    """With commit.gpgsign set, re-create each commit the replay made, signed.
+
+    `commit-tree` ignores commit.gpgsign, and the replay stays unsigned so
+    plan and a stopped restack never call gpg and a rerun rebuilds the same
+    commits. Here, just before the write, each new commit (oldest first) is
+    made again with `commit-tree -S`: the same tree, author, committer and
+    message, on its parents' signed copies. Commits the replay reused keep
+    their own signatures.
+    """
+    git, g = rp.git, rp.g
+    if git.run("config", "--type=bool", "commit.gpgsign", check=False).stdout.strip() != "true":
+        return
+    tips = sorted({rp.new_tip[b] for b in rp.moved()})
+    if not tips:
+        return
+    known = sorted({*g.refs.values(), g.trunk_commit})
+    new = git.out(
+        "rev-list", "--topo-order", "--reverse", "--stdin", input="\n".join([*tips, *("^" + c for c in known)]) + "\n"
+    ).split()
+    signed: dict[str, str] = {}
+    for c in new:
+        head, _, message = git.run("cat-file", "commit", c).stdout.partition("\n\n")
+        fields = dict(line.split(" ", 1) for line in head.split("\n") if " " in line and not line.startswith("parent "))
+        parents = [line.split(" ", 1)[1] for line in head.split("\n") if line.startswith("parent ")]
+        env = {}
+        for who, line in (("AUTHOR", fields["author"]), ("COMMITTER", fields["committer"])):
+            m = AUTHOR.match(line)
+            env |= {f"GIT_{who}_NAME": m[1], f"GIT_{who}_EMAIL": m[2], f"GIT_{who}_DATE": f"@{m[3]} {m[4]}"}
+        args = [x for p in parents for x in ("-p", signed.get(p, p))]
+        signed[c] = git.out("commit-tree", "-S", fields["tree"], *args, "-F", "-", input=message, env=env)
+    remap = lambda d: {k: signed.get(v, v) for k, v in d.items()}
+    rp.new_tip, rp.new_base, rp.below, rp.map = remap(rp.new_tip), remap(rp.new_base), remap(rp.below), remap(rp.map)
+
+
+def checked_out(git: Git) -> dict[str, str]:
+    """Each branch checked out in a worktree, this one included -> its path."""
+    out, path = {}, None
+    for line in git.out("worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            path = line.removeprefix("worktree ")
+        elif line.startswith("branch refs/heads/"):
+            out[line.removeprefix("branch refs/heads/")] = path
+    return out
+
+
+def write(rp: Replay) -> Written:
+    """Move every branch the replay moved, in one transaction guarded by the old values.
+
+    A branch checked out in a worktree, this one or another, moves with
+    `git reset --keep` in that worktree after the transaction, so its files
+    move with it; a worktree with changes in the way refuses, and is left
+    as it was.
+    """
+    g, git = rp.g, rp.git
+    worktrees = checked_out(git)
+    done = Written(time.strftime(f"{BACKUPS}%Y-%m-%d-%H%M%S/"))
+    named = {*g.tip.values(), g.trunk_commit, *g.parents, *rp.new_tip.values(), *rp.map.values()}
+    cmds = []
+    for b in rp.moved():
+        old, new = rp.old_tip[b], rp.new_tip[b]
+        done.moved.append(b)
+        cmds.append(f"create {done.backup}{b} {old}")
+        if b not in worktrees:
+            cmds.append(f"update refs/heads/{b} {new} {old}")
+        record, base = g.refs.get(BASE_RECORDS + b), rp.new_base[b]
+        if base not in named:
+            cmds.append(f"update {BASE_RECORDS}{b} {base} {record or '0' * 40}")
+        elif record:
+            cmds.append(f"delete {BASE_RECORDS}{b} {record}")
+    if cmds:
+        git.run("update-ref", "--stdin", input="\n".join(cmds) + "\n")
+    for b in list(done.moved):
+        if wt := worktrees.get(b):
+            p = Git(wt).run("reset", "-q", "--keep", rp.new_tip[b], check=False)
+            if p.returncode:
+                done.moved.remove(b)
+                done.failed.append((b, wt, p.stderr.strip()))
+    return done
+
+
+# ============================================================================
+# scratch
+#
+# Scratch worktrees check a rewritten tip; a restack conflict stops in place.
+#
+# A scratch worktree is a detached `git worktree add` under the repo's common
+# git dir, so it never holds a branch. A conflict stops where restack was run,
+# the way rebase does: that worktree is detached at the replayed parent with
+# git's own conflict state, and put back on its branch when the restack ends
+# or is aborted. A stopped restack keeps its state under the common git dir;
+# nothing it needs lives in a ref until the final write.
+# ============================================================================
+
+WORKTREES = "stack-worktrees"
+STATE = "stack-restack"
+RERERE = ("-c", "rerere.enabled=true")
+
+
+def common_dir(git: Git) -> str:
+    return os.path.realpath(os.path.join(git.cwd, git.out("rev-parse", "--git-common-dir")))
+
+
+def open_worktree(git: Git, name: str, commit: str) -> Git:
+    """A detached worktree at `commit`, replacing any left under that name."""
+    path = os.path.join(common_dir(git), WORKTREES, name)
+    remove_worktree(git, path)
+    git.run("worktree", "add", "-q", "--detach", path, commit)
+    return Git(path)
+
+
+def remove_worktree(git: Git, path: str):
+    if os.path.exists(path):
+        git.run("worktree", "remove", "--force", path, check=False)
+        shutil.rmtree(path, ignore_errors=True)
+    git.run("worktree", "prune", check=False)
+
+
+@contextmanager
+def worktree(git: Git, name: str, commit: str):
+    wt = open_worktree(git, name, commit)
+    try:
+        yield wt
+    finally:
+        remove_worktree(git, wt.cwd)
+
+
+def run_exec(git: Git, tips: list[tuple[str, str]], cmd: str) -> str | None:
+    """Run `cmd` at each (branch, commit) in a scratch worktree; the first failure, or None."""
+    for b, tip in tips:
+        print(f"exec at {b} ({tip[:12]}): {cmd}", flush=True)
+        with worktree(git, "exec", tip) as wt:
+            if subprocess.run(cmd, shell=True, cwd=wt.cwd).returncode:
+                return f"{b}: {cmd!r} failed at {tip[:12]}"
+    return None
+
+
+# -- a stopped restack ----------------------------------------------------
+
+
+def state_path(git: Git) -> str:
+    return os.path.join(common_dir(git), STATE, "state.json")
+
+
+def load(git: Git) -> dict | None:
+    try:
+        with open(state_path(git)) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def save(git: Git, state: dict):
+    path = state_path(git)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(state, f, indent=1)
+
+
+def clear(git: Git, state: dict):
+    """Drop a restack's state, and put the worktree it stopped in back where
+    it was, unless someone has checked something else out there since."""
+    if home := state.get("home"):
+        wt = Git(home["path"])
+        if wt.run("symbolic-ref", "-q", "HEAD", check=False).returncode:  # still detached
+            wt.run("reset", "-q", "--hard")
+            wt.run("checkout", "-q", *([home["branch"]] if home["branch"] else ["--detach", home["head"]]))
+    shutil.rmtree(os.path.dirname(state_path(git)), ignore_errors=True)
+
+
+def home(git: Git, conflict: Conflict) -> dict:
+    """Where a restack stops: the worktree it was run in, which must be clean."""
+    path = git.out("rev-parse", "--show-toplevel")
+    wt = Git(path)
+    if wt.out("status", "--porcelain", "--untracked-files=no"):
+        raise StackError(
+            f"conflict: {conflict}\n{path} has uncommitted changes, so restack can't stop there"
+            " to resolve it. Commit or stash them and run it again; no ref was written"
+        )
+    branch = wt.run("symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+    return {"path": path, "branch": branch or None, "head": wt.out("rev-parse", "HEAD")}
+
+
+def stop_at(git: Git, state: dict, conflict: Conflict) -> tuple[Git, str | None]:
+    """Detach the worktree restack was run in at the conflict's new parent and
+    redo the step there, leaving git's usual conflict state to resolve.
+
+    A merge is redone as a plain merge, so when the old merge carried more
+    than that, the command that carries it is returned as well.
+    """
+    if "home" not in state:
+        state["home"] = home(git, conflict)
+    wt = Git(state["home"]["path"])
+    wt.run("reset", "-q", "--hard")  # the last conflict's resolution, already taken
+    wt.run("checkout", "-q", "--detach", conflict.parents[0])
+    carry = None
+    if len(conflict.parents) == 1:
+        wt.run(*RERERE, "cherry-pick", "--no-commit", conflict.commit, check=False)
+    else:
+        wt.run(*RERERE, "merge", "--no-ff", "--no-commit", conflict.parents[1], check=False)
+        if old := conflict.commit:
+            p = git.run("merge-tree", "--write-tree", f"{old}^1", f"{old}^2", check=False)
+            plain = p.stdout.split("\n", 1)[0]
+            if plain != git.out("rev-parse", f"{old}^{{tree}}"):
+                carry = f"git diff {plain} {old} | git apply --3way"
+    state["conflict"] = {"key": conflict.key, "parent": conflict.parents[0], "text": str(conflict)}
+    save(git, state)
+    return wt, carry
+
+
+def resolution(state: dict) -> str:
+    """The tree the user resolved where the restack stopped.
+
+    Either they committed on top of the parent, and the commit's tree is
+    taken, or they staged every file, and the index is.
+    """
+    wt = Git(state["home"]["path"])
+    if wt.out("ls-files", "--unmerged"):
+        raise StackError(f"unresolved files in {wt.cwd}: resolve them and `git add` them first")
+    try:
+        wt.run(*RERERE, "rerere")  # record the resolution for the next time
+    except GitError:
+        pass
+    head = wt.out("rev-parse", "HEAD")
+    if head != state["conflict"]["parent"]:
+        if wt.out("rev-parse", "HEAD~1") != state["conflict"]["parent"]:
+            raise StackError(f"{wt.cwd}: commit the resolution as one commit on the parent")
+        if wt.out("status", "--porcelain", "--untracked-files=no"):
+            raise StackError(f"{wt.cwd}: uncommitted changes on top of the resolved commit")
+        return wt.out("rev-parse", "HEAD^{tree}")
+    if wt.run("diff", "--quiet", check=False).returncode:
+        raise StackError(f"{wt.cwd}: unstaged changes; `git add` the resolution first")
+    return wt.out("write-tree")
+
+
+# ============================================================================
+# upstream
+#
+# Spot a moving branch's commits that its new base already holds.
+#
+# These are only suggestions: nothing is dropped unless the line says so,
+# with a `name:` range that leaves the commits out. Each branch's regular
+# (non-merge) commits are checked against the commits its new base, merges
+# included, brings in that its old tip lacked:
+#
+# - patch-id: `git cherry` finds the same diff upstream;
+# - range-diff: `git range-diff` pairs it with a changed upstream commit,
+#   tried only when at most RANGE_DIFF_MAX commits came in;
+# - empty: replaying it onto the new base changes nothing.
+# ============================================================================
+
+RANGE_DIFF_MAX = 200
+PAIR = re.compile(r"\s*(?:\d+|-+):\s+(?:[0-9a-f]+|-+)\s+([=!<>])\s+(?:\d+|-+):\s+([0-9a-f]+|-+)\s")
+
+
+@dataclass
+class Drops:
+    branch: str
+    found: list[tuple[str, str, str]]  # (old commit, title, why), oldest first
+    fragment: str | None  # `term > name:runs` keeping the rest; None when nothing is left
+
+
+def suggest(rp: Replay, name=lambda c: c) -> list[Drops]:
+    """Drop suggestions for each moved branch. `name` maps an old commit to
+    the hash the fragment should print: the old one for plan, the new one
+    once restack has written the refs."""
+    out = []
+    for b in rp.moved():
+        regular = rp.regular(b)
+        if not regular:
+            continue
+        why = upstream(rp, regular, rp.below[b])
+        if not why:
+            continue
+        found = [(c, rp.commit(c).title, why[c]) for c in regular if c in why]
+        out.append(Drops(b, found, fragment(rp, b, [c for c in regular if c not in why], name)))
+    return out
+
+
+def upstream(rp: Replay, regular: list[str], onto: str) -> dict[str, str]:
+    git = rp.git
+    first, last = regular[0], regular[-1]
+    ours = set(regular)
+    why: dict[str, str] = {}
+    for line in git.out("cherry", onto, last, f"{first}^").splitlines():
+        sign, c = line.split()
+        if sign == "-" and c in ours:
+            why[c] = "patch-id matches upstream"
+
+    if int(git.out("rev-list", "--count", onto, f"^{last}")) <= RANGE_DIFF_MAX:
+        p = git.run("range-diff", "--no-color", "--no-notes", f"{last}..{onto}", f"{first}^..{last}", check=False)
+        for line in p.stdout.splitlines() if p.returncode == 0 else []:
+            m = PAIR.match(line)
+            if m and m[1] in "=!":
+                c = next((c for c in regular if c.startswith(m[2])), None)
+                if c and c not in why:
+                    why[c] = "range-diff pairs it with an upstream commit"
+
+    for c in regular:
+        new = rp.map.get(c, c)
+        if c not in why and new != c and empty(rp, new) and not empty(rp, c):
+            why[c] = "replays as an empty commit"
+    return why
+
+
+def empty(rp: Replay, c: str) -> bool:
+    ps = rp.commit(c).parents
+    return bool(ps) and rp.commit(c).tree == rp.commit(ps[0]).tree
+
+
+def fragment(rp: Replay, b: str, keep: list[str], name) -> str | None:
+    """The chain `term > b:runs` that keeps `keep`, runs split where a drop sits.
+    A range's runs stay apart, so the gaps it already leaves stay out."""
+    if not keep:
+        return None
+    runs = []
+    for whole in rp.ranges.get(b) or [rp.regular(b)]:
+        run = []
+        for c in whole:
+            if c in keep or len(rp.commit(c).parents) > 1:
+                run.append(c)
+            elif run:
+                runs.append(run)
+                run = []
+        if run:
+            runs.append(run)
+    spec = ",".join(f"{name(r[0])[:12]}^..{name(r[-1])[:12]}" for r in runs)
+    return f"{format_term(rp.term[b])} > {b}:{spec}"
+
+
+def report(drops: list[Drops], out):
+    if not drops:
+        return
+    print("already upstream? (a suggestion; nothing is dropped unless the line says so)", file=out)
+    for d in drops:
+        for c, title, why in d.found:
+            print(f"  {d.branch}: {c[:12]} {title}  ({why})", file=out)
+        if d.fragment:
+            print(f"  to drop, add to the line:  ; {d.fragment}", file=out)
+        else:
+            print(f"  every commit of {d.branch} looks upstream; restack what sits on it onto its base", file=out)
+
+
+# ============================================================================
+# view
+#
+# How `show` draws a line for a person. Every branch has one base, term[0], so
+# the bases form a tree: a branch hangs under the printed branch its base
+# names, or under the base itself when that's the trunk, a hash or a ref
+# outside the set. `+` merges are the only edges across it, so they ride on
+# the right of the row as labels.
+#
+#     origin/master
+#     ├─ feat/web-api        1 commit
+#     │  └─ feat/web-search  3 commits  + feat/ui-12-index
+#     └─ feat/ui-12-index    2 commits
+#
+# A name that shares a prefix with another name in the line, cut at a '/' or
+# '-', has the longest such prefix dimmed: what's left is what tells it from
+# its nearest neighbour. The name is still printed whole, so it copies whole.
+# ============================================================================
+
+DIM, UNDIM = "\033[2m", "\033[22m"
+
+
+def shared_prefixes(names: set[str]) -> dict[str, str]:
+    """Each name's longest prefix that ends at a '/' or '-' and starts some
+    other name too, or is it and the cut; names that share none are left out."""
+    dims = {}
+    for n in names:
+        cuts = [i + 1 for i, ch in enumerate(n[:-1]) if ch in "/-"]
+        shared = lambda p: any(o != n and (o.startswith(p) or o == p[:-1]) for o in names)
+        p = next((n[:i] for i in reversed(cuts) if shared(n[:i])), "")
+        if p:
+            dims[n] = p
+    return dims
+
+
+def names(terms: dict[str, Term]) -> set[str]:
+    """Every name the line prints: the branches, their bases and their merges."""
+    return set(terms) | {ref_name(r) for t in terms.values() for r in t}
+
+
+def paint(ref: str, dims: dict[str, str], color: bool) -> str:
+    p = dims.get(ref_name(ref)) if color else None
+    return f"{DIM}{p}{UNDIM}{ref[len(p):]}" if p else ref
+
+
+def paint_line(line: str, dims: dict[str, str], color: bool) -> str:
+    return re.sub(r"[^\s>+;]+", lambda m: paint(m.group(), dims, color), line) if color else line
+
+
+def tree(derived: dict[str, Branch], color: bool) -> str:
+    """Draw the branches as a tree of bases, a commit count and merges on each row."""
+    terms = {b: d.term for b, d in derived.items()}
+    dims = shared_prefixes(names(terms))
+    order = topo_order(terms)
+    children: dict[str, list[str]] = defaultdict(list)
+    roots: list[str] = []
+    for b in order:
+        base = terms[b][0]
+        under = ref_name(base) if ref_name(base) in terms else base
+        if under not in terms and under not in roots:
+            roots.append(under)
+        children[under].append(b)
+
+    rows: list[tuple[str, str, str, str]] = []  # (indent, name, count, labels)
+
+    def walk(b: str, indent: str):
+        kids = children[b]
+        for i, k in enumerate(kids):
+            last = i == len(kids) - 1
+            base, merges = terms[k][0], terms[k][1:]
+            n = len(derived[k].own)
+            labels = [f"on {paint(base, dims, color)}"] if base != b and base not in roots else []
+            labels += [f"+ {paint(m, dims, color)}" for m in merges]
+            rows.append((indent + ("└─ " if last else "├─ "), k, f"{n} commit{'s' * (n != 1)}", "  ".join(labels)))
+            walk(k, indent + ("   " if last else "│  "))
+
+    for r in roots:
+        rows.append(("", r, "", ""))
+        walk(r, "")
+    name_w = max(len(i) + len(n) for i, n, c, _ in rows if c)
+    count_w = max(len(c) for _, _, c, _ in rows)
+    out = []
+    for indent, name, count, labels in rows:
+        pad = " " * (name_w - len(indent) - len(name))
+        row = f"{indent}{paint(name, dims, color)}{pad}  {count:<{count_w}}  {labels}"
+        out.append(row.rstrip() if count else indent + paint(name, dims, color))
+    return "\n".join(out)
+
+
+# ============================================================================
+# cli
+#
+# git-merge-stack: show, plan and restack a stack written as one line.
+# ============================================================================
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="git merge-stack", description="Show, plan and restack a stack written as one line.")
+    p.add_argument("-C", dest="repo", default=".", help="run in this repo")
+    p.add_argument("--trunk", help="the fixed floor of every stack (default: origin/HEAD, then origin/main, ...)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    show = sub.add_parser("show", help="print the line for the stacks in this repo")
+    show.add_argument("branches", nargs="*", help="print what a restack of these could move: what they build on and what builds on that (default: HEAD's branch)")
+    which = show.add_mutually_exclusive_group()
+    which.add_argument("--all", action="store_true", help="print every branch off the trunk")
+    which.add_argument("--only", action="store_true", help="print just the named branches, not their stacks")
+    show.add_argument("--no-record", action="store_true", help="don't record hash bases under refs/stack/base/")
+    form = show.add_mutually_exclusive_group()
+    form.add_argument("--tree", action="store_true", help="draw the stack as a tree only (default on a terminal: the tree, then the line)")
+    form.add_argument("--line", action="store_true", help="print the line only (default when piped)")
+    show.add_argument("--no-color", action="store_true", help="don't dim shared name prefixes (only a terminal gets color)")
+    plan = sub.add_parser("plan", help="replay a line in memory and report what moves and every conflict")
+    plan.add_argument("line", nargs="?")
+    plan.add_argument("-f", dest="file", metavar="FILE", help="read the line from FILE ('-' for stdin), a chain per line")
+    restack = sub.add_parser("restack", help="make the graph match a line")
+    restack.add_argument("line", nargs="?", help="default: HEAD's stack from show, each X~N naming a branch in it refreshed to X")
+    restack.add_argument("-f", dest="file", metavar="FILE", help="read the line from FILE ('-' for stdin), a chain per line")
+    restack.add_argument("-i", "--interactive", action="store_true", help="edit the refreshed line in the git editor first")
+    restack.add_argument("--exec", metavar="CMD", help="run CMD at each moved branch's new tip before writing")
+    how = restack.add_mutually_exclusive_group()
+    how.add_argument("--continue", dest="cont", action="store_true", help="take the resolved conflict and carry on")
+    how.add_argument("--abort", action="store_true", help="drop a stopped restack; no ref is written")
+    args = p.parse_args(argv)
+
+    if args.cmd == "show" and args.only and not args.branches:
+        p.error("--only takes the branches to print")
+    if args.cmd == "show" and args.all and args.branches:
+        p.error("--all prints every branch; name branches or pass --all, not both")
+    if args.cmd in ("plan", "restack") and args.file:
+        if args.line is not None:
+            p.error("pass a line or -f FILE, not both")
+        if args.cmd == "restack" and args.interactive:
+            p.error("-i edits the line restack derives from HEAD's stack; -f gives your own")
+        try:
+            with sys.stdin if args.file == "-" else open(args.file) as f:
+                args.line = join_lines(f.read())
+        except OSError as e:
+            p.error(f"-f: {e}")
+        if not args.line:
+            p.error(f"-f: {args.file} holds no line")
+    if args.cmd == "plan" and args.line is None:
+        p.error("plan takes a line, or -f FILE")
+    if args.cmd == "restack" and (args.cont or args.abort):
+        if args.line is not None or args.interactive:
+            p.error("--continue and --abort take no line; a stopped restack keeps the one it started with")
+        if args.exec:
+            p.error("--exec goes with the line; a stopped restack keeps the one it started with")
+    if args.cmd == "restack" and args.line is not None and args.interactive:
+        p.error("-i edits the line restack derives from HEAD's stack; pass a line or -i, not both")
+    try:
+        if args.cmd == "restack":
+            return run_restack(Git(args.repo), args)
+        graph = Graph(Git(args.repo), args.trunk)
+        if args.cmd == "show":
+            branches = args.branches
+            if not branches and not args.all:
+                head, why = graph.head()
+                if why:
+                    print(f"note: {why}; showing every branch off {short(graph.trunk)}", file=sys.stderr)
+                branches = [head] if head else []
+            derived, warnings = graph.show(branches, record=not args.no_record, expand=bool(branches) and not args.only)
+            warn(warnings)
+            terms = {b: d.term for b, d in derived.items()}
+            color = tty() and not args.no_color
+            parts = []
+            if args.tree or (tty() and not args.line):
+                parts.append(tree(derived, color))
+            if not args.tree:
+                parts.append(paint_line(format_line(terms), shared_prefixes(names(terms)), color))
+            print("\n\n".join(parts))
+            return 0
+        if args.cmd == "plan":
+            return run_plan(Replay(graph, args.line).run())
+    except (GitError, LineError, StackError) as e:
+        print(f"git-merge-stack: {e}", file=sys.stderr)
+        return 1
+
+
+def tty() -> bool:
+    return sys.stdout.isatty()
+
+
+def warn(warnings: list[str]):
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
+
+
+def print_moves(rp: Replay, branches: list[str]):
+    for b in branches:
+        print(f"{b}: {rp.old_tip[b][:12]} -> {rp.new_tip[b][:12]}")
+        for old, new, title in rp.moves(b):
+            print(f"  {old[:12]} -> {new[:12]}  {title}")
+
+
+def run_plan(rp: Replay) -> int:
+    """Exit 1 when the replay conflicts, or restack would refuse it."""
+    warn(rp.warnings)
+    moved = rp.moved()
+    print_moves(rp, moved)
+    if not moved:
+        print("nothing moves")
+    lost, held = dropped(rp)
+    report_dropped(held)
+    for d in lost:
+        print(f"restack would refuse: drops {d}")
+    for c in rp.conflicts:
+        print(f"conflict: {c}")
+    report(suggest(rp), sys.stdout)
+    return 1 if rp.conflicts or lost else 0
+
+
+def report_dropped(held: list[str]):
+    if held:
+        print("dropped, their patch is already in the new history:")
+        for d in held:
+            print(f"  {d}")
+
+
+def refresh(derived: dict[str, Branch]) -> tuple[dict[str, Term], list[str]]:
+    """Every term with each `X~N` that names a printed branch made `X`, so
+    each branch goes onto the current tip of what it's stacked on; and what
+    changed, as `X~N -> X`, a merge as `+ X~N -> + X`."""
+    terms: dict[str, Term] = {}
+    changed: list[str] = []
+    for b, d in derived.items():
+        term = []
+        for i, r in enumerate(d.term):
+            if (name := ref_name(r)) in derived and r != name:
+                sign = "+ " if i else ""
+                if (c := f"{sign}{r} -> {sign}{name}") not in changed:
+                    changed.append(c)
+                r = name
+            term.append(r)
+        terms[b] = tuple(term)
+    return terms, changed
+
+
+def unnamed(graph: Graph, derived: dict[str, Branch]) -> list[str]:
+    """A warning for each stack commit the line can only name by hash: it has
+    no tip to refresh to, so it stays where it is."""
+    out = []
+    for b, d in derived.items():
+        for i, r in enumerate(d.term):
+            if re.fullmatch(r"[0-9a-f]{12}", r) and r not in graph.tip:
+                c = graph.git.commit(r)
+                if c in graph.parents:
+                    what = "merges" if i else "sits on"
+                    out.append(
+                        f"{b}: {what} {r}, a commit of {graph.owner(c)[0]} with no name to refresh to;"
+                        " it stays (put a branch there, or edit the line with restack -i)"
+                    )
+    return out
+
+
+def normal(line: str) -> str:
+    """A line with its spacing evened out, to tell an edit from a no-op."""
+    return " ; ".join(" > ".join(map(format_term, chain)) for chain in parse(line))
+
+
+EDIT_HELP = """\
+# Restack HEAD's stack onto the line above. Save and quit to run it; lines
+# starting with '#' are ignored. It may span several lines: a line break
+# starts a new chain, unless the line ends with, or the next starts with,
+# '>', '+' or ';'.
+#
+# Each X~N that names a branch here was refreshed to X, so every branch goes
+# onto the current tip of what it's stacked on. To keep a branch on an older
+# commit of X, put its ~N back. Saving it empty, or as the unrefreshed line,
+# aborts and writes nothing.
+"""
+
+
+def edit(git: Git, line: str, old: str, changed: list[str], drawn: str) -> str | None:
+    """Open the git editor on `line`; what was saved, or None to abort."""
+    path = os.path.join(common_dir(git), "MERGE_STACK_LINE")
+    notes = [f"unrefreshed: {old}", f"refreshed: {', '.join(changed)}"] if changed else ["nothing was refreshed"]
+    with open(path, "w") as f:
+        f.write(f"{line}\n\n{EDIT_HELP}#\n")
+        f.write("".join(f"# {n}\n" for n in notes) + "#\n")
+        f.write("".join(f"# {row}".rstrip() + "\n" for row in drawn.splitlines()))
+    editor = git.out("var", "GIT_EDITOR")
+    try:
+        if subprocess.run(["sh", "-c", f'{editor} "$@"', editor, path], cwd=git.cwd).returncode:
+            print("git-merge-stack: the editor failed; no ref was written", file=sys.stderr)
+            return None
+        with open(path) as f:
+            saved = join_lines(f.read())
+    finally:
+        os.remove(path)
+    if not saved or normal(saved) == normal(old):
+        print("git-merge-stack: nothing to do; no ref was written", file=sys.stderr)
+        return None
+    return saved
+
+
+def head_line(git: Git, args) -> str | int:
+    """HEAD's stack as `show` derives it, refreshed (and edited, with -i):
+    the line to run, or the exit code when there's nothing to run."""
+    graph = Graph(git, args.trunk)
+    head, why = graph.head()
+    if why:
+        raise StackError(f"{why}, so it has no stack to refresh; pass a line")
+    derived, warnings = graph.show([head], record=False, expand=True)
+    warn(warnings + unnamed(graph, derived))
+    old = format_line({b: d.term for b, d in derived.items()})
+    terms, changed = refresh(derived)
+    line = format_line(terms)
+    warn([
+        f"{b}: goes onto {d.tied}'s tip, but they fork equally, so which one is stacked"
+        " on the other is a guess; restack -i to choose"
+        for b, d in derived.items() if d.tied and terms[b][0] != d.term[0]
+    ])
+    if args.interactive:
+        saved = edit(git, line, old, changed, tree(derived, color=False))
+        if saved is None:
+            return 1
+        line = saved
+    elif not changed:
+        print("nothing to refresh: every branch is on the current tip of what it's stacked on")
+        return 0
+    else:
+        print(f"refreshed: {', '.join(changed)}")
+    print(f"line: {line}", flush=True)
+    return line
+
+
+def unmoved(refs: dict[str, str]) -> dict[str, str]:
+    """The refs a line can name, which a stopped restack expects to hold still."""
+    return {r: c for r, c in refs.items() if r.startswith(("refs/heads/", "refs/remotes/", "refs/tags/"))}
+
+
+def run_restack(git: Git, args) -> int:
+    """Replay the line, stopping at a conflict in the worktree it was run in.
+
+    A stopped restack is its state file; `--continue` replays the same line
+    from scratch with the resolutions so far, and the pinned date makes that
+    rerun rebuild the same commits.
+    """
+    state = load(git)
+    if args.abort or args.cont:
+        if not state:
+            raise StackError("no restack is stopped")
+        if args.abort:
+            clear(git, state)
+            print("restack aborted; no ref was written")
+            return 0
+        state["resolved"][state["conflict"]["key"]] = resolution(state)
+    elif state:
+        raise StackError(
+            f"a restack is stopped at {state['conflict']['text']}; --continue or --abort it first"
+        )
+    else:
+        if args.line is None:
+            line = head_line(git, args)
+            if isinstance(line, int):
+                return line
+            args.line = line
+        state = {"line": args.line, "trunk": args.trunk, "exec": args.exec,
+                 "date": int(time.time()), "resolved": {}}
+
+    graph = Graph(git, state["trunk"])
+    if "refs" in state and unmoved(graph.refs) != state["refs"]:
+        raise StackError("refs moved since the restack stopped; --abort it and restack again")
+    state["refs"] = unmoved(graph.refs)
+    # The whole line is replayed, past conflicts on merge-tree's conflicted
+    # trees, so a line that drops commits is refused before anyone resolves
+    # a conflict. Up to the first conflict, the replay is the one a stop
+    # would have made.
+    rp = Replay(graph, state["line"], resolved=state["resolved"], date=state["date"]).run()
+    warn(rp.warnings)
+    lost, held = dropped(rp)
+    if lost:
+        clear(git, state)
+        print("git-merge-stack: refusing: the line drops these commits from their branches:", file=sys.stderr)
+        for d in lost:
+            print(f"  {d}", file=sys.stderr)
+        return 1
+    if rp.conflicts:
+        c = rp.conflicts[0]
+        try:
+            wt, carry = stop_at(git, state, c)
+        except (GitError, StackError):
+            clear(git, state)
+            raise
+        print(f"conflict: {c}", file=sys.stderr)
+        print(
+            f"git-merge-stack: stopped at that commit in {wt.cwd}; no ref was written yet.\n"
+            "Fix the files there and `git add` them, then:\n"
+            "  git merge-stack restack --continue    # or --abort to put everything back",
+            file=sys.stderr,
+        )
+        if len(c.parents) == 1 and (why := upstream(rp, [c.commit], c.parents[0]).get(c.commit)):
+            print(
+                f"It may already be upstream ({why}); `git-merge-stack plan` the line to see what to drop.",
+                file=sys.stderr,
+            )
+        if carry:
+            print(
+                "The old merge changed more than a plain merge does; once resolved, carry that over with:\n"
+                f"  {carry}",
+                file=sys.stderr,
+            )
+        return 1
+    if not rp.moved():
+        clear(git, state)
+        print("nothing moves")
+        return 0
+    if state["exec"] and (failed := run_exec(git, [(b, rp.new_tip[b]) for b in rp.moved()], state["exec"])):
+        clear(git, state)
+        print(f"git-merge-stack: {failed}; no ref was written", file=sys.stderr)
+        return 1
+    try:
+        sign(rp)
+    except GitError as e:
+        print(f"git-merge-stack: signing failed, so no ref was written: {e}", file=sys.stderr)
+        return 1
+    clear(git, state)
+    done = write(rp)
+    print_moves(rp, done.moved)
+    report_dropped(held)
+    if done.moved:
+        print(f"backups: {done.backup}")
+    if unwritten := [b for b in rp.moved() if b not in rp.written]:
+        print(f"moved, though the line didn't write them: {', '.join(unwritten)}")
+    report(suggest(rp, name=lambda c: rp.map.get(c, c)), sys.stdout)
+    for b, wt, why in done.failed:
+        print(
+            f"git-merge-stack: {b} did NOT move: it's checked out in {wt}, which has changes"
+            f" in the way ({why}). Commit or stash them there, then move it with:\n"
+            f"  git -C {wt} reset --keep {rp.new_tip[b]}",
+            file=sys.stderr,
+        )
+    return 1 if done.failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
