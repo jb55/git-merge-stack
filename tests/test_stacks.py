@@ -4,6 +4,7 @@ import subprocess
 
 import pytest
 
+from test_refresh import editor
 from test_replay import CARD_LINE, conflicting, run
 from test_scratch import stopped_worktree
 from test_sign import signed, signing
@@ -73,6 +74,47 @@ def test_save_with_no_line_takes_heads_stack(repo, shape, capsys):
     assert code == 0, err
     line, _ = repo.show("--line", capsys=capsys)
     assert saved(repo) == line.replace(" ; ", "\n")
+
+
+SCISSORS = "# ------------------------ >8 ------------------------\n"
+
+
+def test_save_interactive_starts_from_heads_stack(repo, shape, monkeypatch, tmp_path, capsys):
+    repo.checkout("filters")
+    line, _ = repo.show("--line", capsys=capsys)
+    text = "# mine\norigin/master > search > filters\napi + search > api-search\n"
+    seen = editor(monkeypatch, tmp_path, text + "\n" + SCISSORS + "# anything here is dropped\n")
+    code, out, err = run(repo, "save", "s", "-i", capsys=capsys)
+    assert code == 0, err
+    shown, below = seen.read_text().split(SCISSORS)
+    assert shown == line.replace(" ; ", "\n") + "\n\n"
+    assert "# └─ search " in below  # HEAD's tree, for reference
+    assert all(s.startswith("#") for s in below.splitlines() if s)
+    assert saved(repo) + "\n" == text
+
+
+def test_save_interactive_edits_the_saved_text(repo, shape, monkeypatch, tmp_path, capsys):
+    text = "# the card's stack\norigin/master > search > filters\n\napi + search\n  > api-search\n"
+    monkeypatch.setattr("sys.stdin", io.StringIO(text))
+    run(repo, "save", "s", "-", capsys=capsys)
+    seen = editor(monkeypatch, tmp_path, None)  # saved as shown
+    code, out, err = run(repo, "save", "s", "-i", capsys=capsys)
+    assert code == 0, err
+    assert seen.read_text().startswith(text + "\n" + SCISSORS)
+    assert out == "s is unchanged\n"
+    assert history(repo) == ["save s"]
+
+
+def test_save_interactive_aborts_on_no_line(repo, shape, monkeypatch, tmp_path, capsys):
+    run(repo, "save", "s", CARD_LINE, capsys=capsys)
+    before = repo.rev(REF)
+    for text in ("", "# only comments\n\n" + SCISSORS + CARD_LINE + "\n"):
+        editor(monkeypatch, tmp_path, text)
+        code, _, err = run(repo, "save", "s", "-i", capsys=capsys)
+        assert code == 1 and "no line, so s was not saved" in err
+    assert repo.rev(REF) == before
+    with pytest.raises(SystemExit):
+        run(repo, "save", "s", "-i", "-", capsys=capsys)
 
 
 def test_save_refuses_ranges_bad_lines_and_bad_names(repo, shape, capsys):

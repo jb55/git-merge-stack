@@ -1637,6 +1637,7 @@ def main(argv: list[str] | None = None) -> int:
     save_p.add_argument("name")
     save_p.add_argument("source", nargs="?", help="a line (anything with '>'), a FILE, or '-' for stdin (default: HEAD's stack from show)")
     save_p.add_argument("-m", dest="message", help="the commit message (default: save <name>)")
+    save_p.add_argument("-i", "--interactive", action="store_true", help="edit it in the git editor first, a chain per line (default: the saved stack, else HEAD's)")
     sub.add_parser("list", help="print each saved stack's name, tip and line")
     args = p.parse_args(argv)
 
@@ -1644,6 +1645,8 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--only takes the branches to print")
     if args.cmd == "show" and args.all and args.branches:
         p.error("--all prints every branch; name branches or pass --all, not both")
+    if args.cmd == "save" and args.interactive and args.source == "-":
+        p.error("-i edits in the git editor; it can't also read stdin")
     if args.cmd == "restack":
         args.text = args.line
     if args.cmd == "restack" and args.file:
@@ -1722,16 +1725,60 @@ def warn(warnings: list[str]):
         print(f"warning: {w}", file=sys.stderr)
 
 
+SCISSORS = "# ------------------------ >8 ------------------------"
+
+SAVE_HELP = """\
+# Do not modify or remove the line above.
+# Everything above it is saved as the stack, as written: a chain per line,
+# '#' comments and line breaks kept. A line that ends with, or one that
+# starts with, '>', '+' or ';' carries its chain on. Save it with no line
+# to abort.
+"""
+
+
+def head_stack(git: Git, args) -> tuple[str, str] | None:
+    """HEAD's stack from show, a chain per line, and its tree; None when
+    HEAD has no stack."""
+    graph = Graph(git, args.trunk)
+    head, why = graph.head()
+    if why:
+        if not args.interactive:
+            raise StackError(f"{why}, so it has no stack to save; pass a line or FILE")
+        return None
+    derived, warnings = graph.show([head], record=False, expand=True)
+    warn(warnings)
+    text = format_line({b: d.term for b, d in derived.items()}).replace(" ; ", "\n") + "\n"
+    return text, tree(derived, False, roots_behind(graph, derived))
+
+
+def edit_stack(git: Git, args, text: str, head: tuple[str, str] | None) -> str | None:
+    """save -i: the editor on `text`, with HEAD's stack below the scissors
+    for reference; what's above them, or None to abort."""
+    shown = (
+        ["HEAD's stack, as show derives it:", "", *head[0].splitlines(), "", *head[1].splitlines()]
+        if head else ["HEAD has no stack to show here."]
+    )
+    out = open_editor(git, f"{text.rstrip()}\n\n{SCISSORS}\n{SAVE_HELP}#\n{comments(shown)}")
+    if out is None:
+        return None
+    kept = out.split(SCISSORS + "\n", 1)[0].rstrip() + "\n"
+    if not join_lines(kept):
+        print(f"git-merge-stack: no line, so {args.name} was not saved", file=sys.stderr)
+        return None
+    return kept
+
+
 def run_save(git: Git, args) -> int:
     src = args.source
-    if src is None:
-        graph = Graph(git, args.trunk)
-        head, why = graph.head()
-        if why:
-            raise StackError(f"{why}, so it has no stack to save; pass a line or FILE")
-        derived, warnings = graph.show([head], record=False, expand=True)
-        warn(warnings)
-        text = format_line({b: d.term for b, d in derived.items()}).replace(" ; ", "\n") + "\n"
+    head = None
+    if src is None or args.interactive:
+        head = head_stack(git, args)
+    if src is None and args.interactive and git.commit(stack_ref(git, args.name)):
+        text = load_stack(git, args.name)
+    elif src is None:
+        if head is None:
+            raise StackError(f"HEAD has no stack and no stack {args.name!r} is saved; pass a line or FILE")
+        text = head[0]
     elif src == "-":
         text = sys.stdin.read()
     elif ">" in src:
@@ -1742,6 +1789,8 @@ def run_save(git: Git, args) -> int:
                 text = f.read()
         except OSError as e:
             raise StackError(f"{src}: {e.strerror}")
+    if args.interactive and (text := edit_stack(git, args, text, head)) is None:
+        return 1
     line = join_lines(text)
     if not line:
         raise StackError("that holds no line")
@@ -1880,23 +1929,33 @@ EDIT_HELP = """\
 """
 
 
-def edit(git: Git, line: str, old: str, changed: list[str], drawn: str) -> str | None:
-    """Open the git editor on `line`; what was saved, or None to abort."""
+def comments(lines: list[str]) -> str:
+    return "".join(f"# {s}".rstrip() + "\n" for s in lines)
+
+
+def open_editor(git: Git, text: str) -> str | None:
+    """Open the git editor on `text`; what was saved, or None when the editor failed."""
     path = os.path.join(common_dir(git), "MERGE_STACK_LINE")
-    notes = [f"unrefreshed: {old}", f"refreshed: {', '.join(changed)}"] if changed else ["nothing was refreshed"]
     with open(path, "w") as f:
-        f.write(f"{line}\n\n{EDIT_HELP}#\n")
-        f.write("".join(f"# {n}\n" for n in notes) + "#\n")
-        f.write("".join(f"# {row}".rstrip() + "\n" for row in drawn.splitlines()))
+        f.write(text)
     editor = git.out("var", "GIT_EDITOR")
     try:
         if subprocess.run(["sh", "-c", f'{editor} "$@"', editor, path], cwd=git.cwd).returncode:
             print("git-merge-stack: the editor failed; no ref was written", file=sys.stderr)
             return None
         with open(path) as f:
-            saved = join_lines(f.read())
+            return f.read()
     finally:
         os.remove(path)
+
+
+def edit(git: Git, line: str, old: str, changed: list[str], drawn: str) -> str | None:
+    """Open the git editor on `line`; what was saved, or None to abort."""
+    notes = [f"unrefreshed: {old}", f"refreshed: {', '.join(changed)}"] if changed else ["nothing was refreshed"]
+    text = open_editor(git, f"{line}\n\n{EDIT_HELP}#\n{comments(notes)}#\n{comments(drawn.splitlines())}")
+    if text is None:
+        return None
+    saved = join_lines(text)
     if not saved or normal(saved) == normal(old):
         print("git-merge-stack: nothing to do; no ref was written", file=sys.stderr)
         return None

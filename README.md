@@ -315,7 +315,7 @@ failure stops the restack, and nothing is written.
 
 ## Saved stacks
 
-    git merge-stack save <name> [<line> | FILE | -] [-m MSG]
+    git merge-stack save <name> [<line> | FILE | -] [-i] [-m MSG]
     git merge-stack list
     git merge-stack restack --stack <name> [-n] [<line> | -f FILE | -i]
 
@@ -334,6 +334,15 @@ text again writes nothing. With `commit.gpgsign` set, the commit is signed
 none, it saves `show`'s line for HEAD's stack, a chain per line. It refuses
 a line with ranges: a range names commits to drop by hash, which is a
 one-off edit, not a shape to keep.
+
+`save -i` opens the git editor first, a chain per line. It starts from the
+line or FILE given; with none, from the saved stack's own text, comments and
+line breaks kept, or from HEAD's stack when `<name>` isn't saved yet. Below a
+scissors line, as in `git commit -v`, it shows HEAD's stack and its tree for
+reference. Everything above the scissors is saved as written, `#` comments
+included. Saving it with no line aborts, and saving it unchanged writes
+nothing. It edits the saved line only. Nothing is restacked, so follow it with
+`restack -n --stack <name>`.
 
 `list` prints each saved stack's name, tip and line.
 
