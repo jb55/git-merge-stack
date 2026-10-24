@@ -140,7 +140,8 @@ commits that sit on x's own chain x's.
     git merge-stack plan '<line>'
     git merge-stack restack '<line>'
 
-Either takes `-f FILE` (`-` for stdin) in place of the line. Each line of the
+Either takes `-f FILE` (`-` for stdin), or `--stack NAME` for a saved
+stack (see [Saved stacks](#saved-stacks)), in place of the line. Each line of the
 file is a chain; a line that ends with, or one that starts with, `>`, `+` or
 `;` carries the chain on. Blank lines and `#` lines are dropped:
 
@@ -278,3 +279,58 @@ apply --3way` that carries the difference over.
 `--exec <cmd>` runs `cmd` with the shell in a scratch worktree at each moved
 branch's new tip, after the replay and before any ref is written. The first
 failure stops the restack, and nothing is written.
+
+## Saved stacks
+
+    git merge-stack save <name> [<line> | FILE | -] [-m MSG]
+    git merge-stack check <name>
+    git merge-stack list
+    git merge-stack plan --stack <name>
+    git merge-stack restack --stack <name> [<line> | -f FILE | -i]
+
+A stack can be saved by name, so the line lives in git instead of a loose
+file. Each saved stack is a ref:
+
+    refs/merge-stacks/<name>   a commit; its tree holds one file, `stack`
+
+`stack` is the line as written, comments and line breaks kept. Each save
+that changes it is a new commit on top of the last, so `git log -p
+merge-stacks/<name>` is the history of the stack's shape. Saving the same
+text again writes nothing. With `commit.gpgsign` set, the commit is signed
+(`commit-tree -S`, since plain `commit-tree` ignores that config).
+
+`save` takes a line (anything with a `>`), a FILE, or `-` for stdin. With
+none, it saves `show`'s line for HEAD's stack, a chain per line. It refuses
+a line with ranges: a range names commits to drop by hash, which is a
+one-off edit, not a shape to keep.
+
+`list` prints each saved stack's name, tip and line.
+
+`check` compares the saved line with the graph and exits 1 on drift, so an
+agent can run it as a gate after a restack. It compares commits, not text,
+so spacing, line breaks and a branch named by suffix don't count. It
+prints one line per difference:
+
+    search: the line has origin/master, the graph has 1a2b3c4d5e6f
+    filters: no such branch; the line stacks it on search
+    filters: has no commits off origin/master; the line stacks it on search
+    filters: sits on search in the graph, but the line leaves it out
+
+A branch the line writes must sit on the commits its term names, with its
+merges in that order. A branch the graph stacks on one of the line's
+branches must be named in the line; what sits on a fixed point, which the
+line only reads, is not its business.
+
+`plan --stack <name>` plans the saved line. `restack --stack <name>`
+restacks it, or the line given with it (a line, `-f FILE`, or `-i` on
+HEAD's stack), and saves that line as `<name>` once the restack is done and
+`check` passes. So the ref only advances when the graph matches the line.
+A stopped restack saves when `--continue` finishes it. A `name:a..b` range
+is saved as plain `name`, since after the restack that branch is those
+commits; an unnamed range has no branch to keep, so `--stack` refuses it
+up front.
+
+Nothing under `refs/merge-stacks/` is pushed or fetched unless you ask:
+`git push` only sends branches and tags by default. To share them:
+
+    git push <remote> 'refs/merge-stacks/*:refs/merge-stacks/*'

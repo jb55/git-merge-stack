@@ -360,6 +360,9 @@ backups: refs/stack-backup/2026-03-14-161205/</div>
         <tr><td>git merge-stack restack -i</td><td>the same, but open the line in your editor first</td></tr>
         <tr><td>restack --continue · --abort</td><td>after a conflict: carry on, or put everything back as it was</td></tr>
         <tr><td>restack --exec 'make test'</td><td>run a check at every moved tip before any ref is written</td></tr>
+        <tr><td>git merge-stack save notes stack</td><td>keep the line in git, as a commit at <code>refs/merge-stacks/notes</code>; <code>list</code> shows what's saved</td></tr>
+        <tr><td>restack --stack notes</td><td>restack the saved line (or a new one), and save it once the graph matches</td></tr>
+        <tr><td>git merge-stack check notes</td><td>exit 1, listing each difference, when the graph has drifted from the saved line</td></tr>
       </tbody>
     </table>
   </div>
