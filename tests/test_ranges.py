@@ -9,8 +9,8 @@ def test_named_range_drops_the_rest(repo, shape, capsys):
     # The api-search rework: keep the lane's first commit, drop the rest.
     l1 = shape["l1"][:12]
     line = f"origin/master > search ; api + search > api-search:{l1}^..{l1}"
-    code, out, err = run(repo, "plan", line, capsys=capsys)
-    assert code == 0, err
+    code, out, err = run(repo, "restack", "-n", line, capsys=capsys)
+    assert code == 1, err
     code, out, err = run(repo, "restack", line, capsys=capsys)
     assert code == 0, err
     search = repo.rev("search")
@@ -78,6 +78,6 @@ def test_merges_inside_a_range_keep_their_shape(repo, capsys):
 
 
 def test_empty_range_is_refused(repo, shape, capsys):
-    code, _, err = run(repo, "plan", "origin/master > search:search..search > filters", capsys=capsys)
+    code, _, err = run(repo, "restack", "-n", "origin/master > search:search..search > filters", capsys=capsys)
     assert code == 1
     assert "holds no commits" in err

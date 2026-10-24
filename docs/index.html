@@ -349,12 +349,12 @@ backups: refs/stack-backup/2026-03-14-161205/</div>
 <section id="commands">
   <div class="wrap">
     <div class="kicker">commands</div>
-    <h2>Show, plan, restack</h2>
+    <h2>Show, restack, save</h2>
     <table class="cmds">
       <thead><tr><th>run</th><th>to</th></tr></thead>
       <tbody>
         <tr><td>git merge-stack show</td><td>print the stack you're on as a tree and a line, derived from the graph</td></tr>
-        <tr><td>git merge-stack plan -f stack</td><td>replay it in memory and report what moves, every conflict, and any commit it would drop. Writes nothing.</td></tr>
+        <tr><td>git merge-stack restack -n -f stack</td><td>how the graph differs from the line, then what would move, every conflict, and any commit it would drop. Writes nothing; exits 0 only when they're in sync.</td></tr>
         <tr><td>git merge-stack restack -f stack</td><td>make the graph match the line (or pass the line as an argument)</td></tr>
         <tr><td>git merge-stack restack</td><td>with no line: put every branch in your stack onto the current tip of what it's stacked on</td></tr>
         <tr><td>git merge-stack restack -i</td><td>the same, but open the line in your editor first</td></tr>
@@ -362,7 +362,7 @@ backups: refs/stack-backup/2026-03-14-161205/</div>
         <tr><td>restack --exec 'make test'</td><td>run a check at every moved tip before any ref is written</td></tr>
         <tr><td>git merge-stack save notes stack</td><td>keep the line in git, as a commit at <code>refs/merge-stacks/notes</code>; <code>list</code> shows what's saved</td></tr>
         <tr><td>restack --stack notes</td><td>restack the saved line (or a new one), and save it once the graph matches</td></tr>
-        <tr><td>git merge-stack check notes</td><td>exit 1, listing each difference, when the graph has drifted from the saved line</td></tr>
+        <tr><td>restack -n --stack notes</td><td>after a fetch or a restack: does the graph still match the saved line?</td></tr>
       </tbody>
     </table>
   </div>

@@ -66,20 +66,20 @@ def test_hash_base_is_recorded(repo, shape, capsys):
     assert out == f"{shape['m2'][:12]} > search"
 
 
-def test_plan_writes_nothing(repo, shape, capsys):
+def test_dry_run_writes_nothing(repo, shape, capsys):
     before = refs(repo)
-    code, out, err = run(repo, "plan", CARD_LINE, capsys=capsys)
-    assert code == 0, err
+    code, out, err = run(repo, "restack", "-n", CARD_LINE, capsys=capsys)
+    assert code == 1, err
     assert refs(repo) == before
-    assert out.startswith("search: ")
-    assert "api-search: " in out and "filters: " in out
+    assert out.startswith("the graph differs from the line:\n  search: the line has origin/master")
+    assert "\nsearch: " in out and "api-search: " in out and "filters: " in out
     assert "carried the difference forward" in err
 
 
-def test_plan_nothing_moves(repo, shape, capsys):
+def test_dry_run_in_sync(repo, shape, capsys):
     out, _ = repo.show("--no-record", capsys=capsys)
-    code, out, _ = run(repo, "plan", out, capsys=capsys)
-    assert (code, out.strip()) == (0, "nothing moves")
+    code, out, _ = run(repo, "restack", "-n", out, capsys=capsys)
+    assert (code, out.strip()) == (0, "nothing moves\nin sync: the graph matches the line")
 
 
 def test_cousin_moves_with_search(repo, shape, capsys):
@@ -100,9 +100,9 @@ def conflicting(repo, shape):
     return m4
 
 
-def test_plan_reports_conflicts_and_restack_writes_nothing(repo, shape, capsys):
+def test_dry_run_reports_conflicts_and_restack_writes_nothing(repo, shape, capsys):
     conflicting(repo, shape)
-    code, out, _ = run(repo, "plan", "origin/master > search", capsys=capsys)
+    code, out, _ = run(repo, "restack", "-n", "origin/master > search", capsys=capsys)
     assert code == 1
     assert f"conflict: search: {shape['s1'][:12]} s1: s1" in out
     before = refs(repo)
@@ -112,9 +112,9 @@ def test_plan_reports_conflicts_and_restack_writes_nothing(repo, shape, capsys):
     assert refs(repo) == before
 
 
-def test_plan_continues_past_a_conflict(repo, shape, capsys):
+def test_dry_run_continues_past_a_conflict(repo, shape, capsys):
     conflicting(repo, shape)
-    code, out, _ = run(repo, "plan", CARD_LINE, capsys=capsys)
+    code, out, _ = run(repo, "restack", "-n", CARD_LINE, capsys=capsys)
     assert code == 1
     # The conflict at s1 doesn't hide what else moves.
     assert "filters: " in out and "api-search: " in out
@@ -174,8 +174,8 @@ def test_drops_a_commit_the_new_history_already_has(repo, shape, capsys):
     copy = repo.rev("HEAD")
     repo.merge("filters", "merge filters")
     line = "api + search > api-search ; api-search + filters > fixes"
-    code, out, err = run(repo, "plan", line, capsys=capsys)
-    assert code == 0, err
+    code, out, err = run(repo, "restack", "-n", line, capsys=capsys)
+    assert code == 1, err
     assert f"dropped, their patch is already in the new history:\n  fixes: {copy[:12]} x2\n" in out
     code, out, err = run(repo, "restack", line, capsys=capsys)
     assert code == 0, err
@@ -190,7 +190,7 @@ def test_refuses_before_stopping_at_a_conflict(repo, shape, capsys):
     # filters: the refusal comes first, so there's nothing to resolve.
     conflicting(repo, shape)
     line = "origin/master > search ; origin/master > filters"
-    code, out, _ = run(repo, "plan", line, capsys=capsys)
+    code, out, _ = run(repo, "restack", "-n", line, capsys=capsys)
     assert code == 1
     assert f"restack would refuse: drops filters: {shape['s2'][:12]} s2" in out
     before = refs(repo)
@@ -215,7 +215,7 @@ def test_claim_at_an_equal_fork(repo, shape, capsys):
 
 
 def test_dropping_an_evil_merge_warns(repo, shape, capsys):
-    code, _, err = run(repo, "plan", "api > api-search", capsys=capsys)
+    code, _, err = run(repo, "restack", "-n", "api > api-search", capsys=capsys)
     assert "dropping merge" in err
 
 
@@ -235,8 +235,8 @@ def test_restack_of_a_whole_line_names_nothing_extra(repo, shape, capsys):
 def test_line_from_a_file(repo, shape, tmp_path, monkeypatch, capsys):
     f = tmp_path / "stack"
     f.write_text("# the card's stack\norigin/master > search > filters\napi + search > api-search\n")
-    code, out, err = run(repo, "plan", "-f", str(f), capsys=capsys)
-    assert code == 0, err
+    code, out, err = run(repo, "restack", "-n", "-f", str(f), capsys=capsys)
+    assert code == 1, err
     assert "search: " in out and "api-search: " in out
     code, out, err = run(repo, "restack", "-f", str(f), capsys=capsys)
     assert code == 0, err
@@ -248,8 +248,8 @@ def test_line_from_a_file(repo, shape, tmp_path, monkeypatch, capsys):
 def test_line_from_stdin(repo, shape, monkeypatch, capsys):
     import io
     monkeypatch.setattr("sys.stdin", io.StringIO("origin/master > search\n"))
-    code, out, err = run(repo, "plan", "-f", "-", capsys=capsys)
-    assert code == 0, err
+    code, out, err = run(repo, "restack", "-n", "-f", "-", capsys=capsys)
+    assert code == 1, err
     assert "search: " in out
 
 
@@ -262,8 +262,8 @@ def test_a_branch_grown_at_its_tip_keeps_its_commits(repo, shape, capsys):
     repo.checkout("search")
     s3 = repo.commit("s3")
     line = "origin/master > search > filters ; api + search > api-search"
-    code, out, err = run(repo, "plan", line, capsys=capsys)
-    assert code == 0, out + err
+    code, out, err = run(repo, "restack", "-n", line, capsys=capsys)
+    assert code == 1, out + err
     assert "would refuse" not in out
     code, out, err = run(repo, "restack", line, capsys=capsys)
     assert code == 0, err
@@ -283,8 +283,8 @@ def test_drops_an_old_copy_the_branch_below_rewrote(repo, shape, capsys):
     (repo.path / "x1").write_text("x1 amended\n")
     repo.git("commit", "-q", "-a", "--amend", "-m", "x1")
     line = "api > fixes"
-    code, out, err = run(repo, "plan", line, capsys=capsys)
-    assert code == 0, out + err
+    code, out, err = run(repo, "restack", "-n", line, capsys=capsys)
+    assert code == 1, out + err
     assert (
         "dropped, old copies of commits the branch below has since rewritten:\n"
         f"  fixes: {shape['x1'][:12]} x1  (an old copy of api's)\n"
@@ -298,7 +298,7 @@ def test_drops_an_old_copy_the_branch_below_rewrote(repo, shape, capsys):
 def test_a_commit_the_branch_below_never_held_is_still_refused(repo, shape, capsys):
     # search's commits under filters were never api's, so moving filters
     # onto api loses them from filters, fork point or not.
-    code, out, _ = run(repo, "plan", "api > filters", capsys=capsys)
+    code, out, _ = run(repo, "restack", "-n", "api > filters", capsys=capsys)
     assert code == 1
     assert f"restack would refuse: drops filters: {shape['s2'][:12]} s2" in out
     assert "old copies" not in out

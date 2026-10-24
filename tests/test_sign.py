@@ -44,10 +44,10 @@ def test_restack_signs_what_it_writes(repo, shape, tmp_path, capsys):
     assert repo.git("show", "api-search:evil") == "evil"
 
 
-def test_plan_never_signs(repo, shape, tmp_path, capsys):
+def test_dry_run_never_signs(repo, shape, tmp_path, capsys):
     log = signing(repo, tmp_path)
-    code, _, err = run(repo, "plan", CARD_LINE, capsys=capsys)
-    assert code == 0, err
+    code, _, err = run(repo, "restack", "-n", CARD_LINE, capsys=capsys)
+    assert code == 1, err
     assert not log.exists()
 
 

@@ -598,8 +598,8 @@ def short(full: str) -> str:
 # Replay a stack line in memory.
 #
 # Every commit is rebuilt with plumbing alone, `git merge-tree --write-tree`
-# and `git commit-tree`, so no worktree, index or ref is touched. `plan` reads
-# the result; `restack` writes it.
+# and `git commit-tree`, so no worktree, index or ref is touched. `restack -n`
+# reads the result; `restack` writes it.
 #
 # The stack is the derived old one with the line laid over it: a branch the
 # line writes takes the line's term, every other stack branch keeps the term
@@ -1027,7 +1027,7 @@ def sign(rp: Replay):
     """With commit.gpgsign set, re-create each commit the replay made, signed.
 
     `commit-tree` ignores commit.gpgsign, and the replay stays unsigned so
-    plan and a stopped restack never call gpg and a rerun rebuilds the same
+    restack -n and a stopped restack never call gpg and a rerun rebuilds the same
     commits. Here, just before the write, each new commit (oldest first) is
     made again with `commit-tree -S`: the same tree, author, committer and
     message, on its parents' signed copies. Commits the replay reused keep
@@ -1291,7 +1291,7 @@ class Drops:
 
 def suggest(rp: Replay, name=lambda c: c) -> list[Drops]:
     """Drop suggestions for each moved branch. `name` maps an old commit to
-    the hash the fragment should print: the old one for plan, the new one
+    the hash the fragment should print: the old one for restack -n, the new one
     once restack has written the refs."""
     out = []
     for b in rp.moved():
@@ -1533,7 +1533,7 @@ def drift(graph: Graph, line: str) -> list[str]:
     """Each way the graph differs from `line`; none when it matches."""
     parents, ranges = read(line)
     if ranges:
-        raise StackError("a line with ranges can't be checked; check the line restack left")
+        raise StackError("a line with ranges names commits, not a shape, so it has nothing to compare")
     git = graph.git
 
     def local(token: str) -> str | None:
@@ -1586,11 +1586,11 @@ def drift(graph: Graph, line: str) -> list[str]:
 # ============================================================================
 # cli
 #
-# git-merge-stack: show, plan and restack a stack written as one line.
+# git-merge-stack: show and restack a stack written as one line, and keep it saved.
 # ============================================================================
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="git merge-stack", description="Show, plan and restack a stack written as one line.")
+    p = argparse.ArgumentParser(prog="git merge-stack", description="Show and restack a stack written as one line.")
     p.add_argument("-C", dest="repo", default=".", help="run in this repo")
     p.add_argument("--trunk", help="the fixed floor of every stack (default: origin/HEAD, then origin/main, ...)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1604,15 +1604,12 @@ def main(argv: list[str] | None = None) -> int:
     form.add_argument("--tree", action="store_true", help="draw the stack as a tree only (default on a terminal: the tree, then the line)")
     form.add_argument("--line", action="store_true", help="print the line only (default when piped)")
     show.add_argument("--no-color", action="store_true", help="don't dim shared name prefixes (only a terminal gets color)")
-    plan = sub.add_parser("plan", help="replay a line in memory and report what moves and every conflict")
-    plan.add_argument("line", nargs="?")
-    plan.add_argument("-f", dest="file", metavar="FILE", help="read the line from FILE ('-' for stdin), a chain per line")
-    plan.add_argument("--stack", metavar="NAME", help="plan the line saved as NAME")
     restack = sub.add_parser("restack", help="make the graph match a line")
     restack.add_argument("line", nargs="?", help="default: HEAD's stack from show, each X~N naming a branch in it refreshed to X")
     restack.add_argument("-f", dest="file", metavar="FILE", help="read the line from FILE ('-' for stdin), a chain per line")
     restack.add_argument("--stack", metavar="NAME", help="restack the line saved as NAME, or the one given; saved as NAME once the graph matches it")
     restack.add_argument("-i", "--interactive", action="store_true", help="edit the refreshed line in the git editor first")
+    restack.add_argument("-n", "--dry-run", action="store_true", help="write nothing: print how the graph differs from the line, then what would move, every conflict and any drop; exit 0 only when they're in sync")
     restack.add_argument("--exec", metavar="CMD", help="run CMD at each moved branch's new tip before writing")
     how = restack.add_mutually_exclusive_group()
     how.add_argument("--continue", dest="cont", action="store_true", help="take the resolved conflict and carry on")
@@ -1621,8 +1618,6 @@ def main(argv: list[str] | None = None) -> int:
     save_p.add_argument("name")
     save_p.add_argument("source", nargs="?", help="a line (anything with '>'), a FILE, or '-' for stdin (default: HEAD's stack from show)")
     save_p.add_argument("-m", dest="message", help="the commit message (default: save <name>)")
-    check = sub.add_parser("check", help="compare a saved stack with the graph; exit 1 on drift")
-    check.add_argument("name")
     sub.add_parser("list", help="print each saved stack's name, tip and line")
     args = p.parse_args(argv)
 
@@ -1630,12 +1625,12 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--only takes the branches to print")
     if args.cmd == "show" and args.all and args.branches:
         p.error("--all prints every branch; name branches or pass --all, not both")
-    if args.cmd in ("plan", "restack"):
+    if args.cmd == "restack":
         args.text = args.line
-    if args.cmd in ("plan", "restack") and args.file:
+    if args.cmd == "restack" and args.file:
         if args.line is not None:
             p.error("pass a line or -f FILE, not both")
-        if args.cmd == "restack" and args.interactive:
+        if args.interactive:
             p.error("-i edits the line restack derives from HEAD's stack; -f gives your own")
         try:
             with sys.stdin if args.file == "-" else open(args.file) as f:
@@ -1645,15 +1640,15 @@ def main(argv: list[str] | None = None) -> int:
         args.line = join_lines(args.text)
         if not args.line:
             p.error(f"-f: {args.file} holds no line")
-    if args.cmd == "plan" and args.stack and args.line is not None:
-        p.error("plan takes a line, -f FILE or --stack NAME, only one")
-    if args.cmd == "plan" and args.line is None and not args.stack:
-        p.error("plan takes a line, -f FILE or --stack NAME")
     if args.cmd == "restack" and (args.cont or args.abort):
         if args.line is not None or args.interactive or args.stack:
             p.error("--continue and --abort take no line; a stopped restack keeps the one it started with")
+        if args.dry_run:
+            p.error("-n previews a line; --continue and --abort carry on a stopped restack")
         if args.exec:
             p.error("--exec goes with the line; a stopped restack keeps the one it started with")
+    if args.cmd == "restack" and args.dry_run and args.exec:
+        p.error("--exec runs at the new tips before they're written; -n writes none")
     if args.cmd == "restack" and args.line is not None and args.interactive:
         p.error("-i edits the line restack derives from HEAD's stack; pass a line or -i, not both")
     try:
@@ -1668,10 +1663,6 @@ def main(argv: list[str] | None = None) -> int:
             for n, c, line in listing:
                 print(f"{n:<{w}}  {c[:12]}  {line}")
             return 0
-        if args.cmd == "check":
-            return run_check(git, args)
-        if args.cmd == "plan" and args.stack:
-            args.line = join_lines(load_stack(git, args.stack))
         graph = Graph(git, args.trunk)
         if args.cmd == "show":
             branches = args.branches
@@ -1698,8 +1689,6 @@ def main(argv: list[str] | None = None) -> int:
                 parts.append(paint_line(format_line(terms), shared_prefixes(names(terms)), color))
             print("\n\n".join(parts))
             return 0
-        if args.cmd == "plan":
-            return run_plan(Replay(graph, args.line).run())
     except (GitError, LineError, StackError) as e:
         print(f"git-merge-stack: {e}", file=sys.stderr)
         return 1
@@ -1744,15 +1733,28 @@ def run_save(git: Git, args) -> int:
     return 0
 
 
-def run_check(git: Git, args) -> int:
-    """Exit 1 when the graph has drifted from the saved line."""
-    diffs = drift(Graph(git, args.trunk), join_lines(load_stack(git, args.name)))
-    for d in diffs:
-        print(d)
+def dry_run(git: Git, args) -> int:
+    """restack -n: how the graph differs from the line, then the replay's
+    preview. Exit 0 only when they're in sync: no difference, nothing
+    moves, nothing conflicts or would be refused."""
+    if args.line is None and args.stack and not args.interactive:
+        args.line = join_lines(load_stack(git, args.stack))
+    if args.line is None:
+        line = head_line(git, args)
+        if isinstance(line, int):
+            return line
+        args.line = line
+    graph = Graph(git, args.trunk)
+    diffs = [] if ranged(args.line) else drift(graph, args.line)
     if diffs:
-        print(f"{args.name}: the graph has drifted from the saved line", file=sys.stderr)
+        print("the graph differs from the line:")
+        for d in diffs:
+            print(f"  {d}")
+    rp = Replay(graph, args.line).run()
+    blocked = preview(rp)
+    if diffs or rp.moved() or blocked:
         return 1
-    print(f"{args.name}: the graph matches the saved line")
+    print("in sync: the graph matches the line")
     return 0
 
 
@@ -1777,8 +1779,8 @@ def print_moves(rp: Replay, branches: list[str]):
             print(f"  {old[:12]} -> {new[:12]}  {title}")
 
 
-def run_plan(rp: Replay) -> int:
-    """Exit 1 when the replay conflicts, or restack would refuse it."""
+def preview(rp: Replay) -> bool:
+    """Print what a restack would do; whether it would conflict or refuse."""
     warn(rp.warnings)
     moved = rp.moved()
     print_moves(rp, moved)
@@ -1791,7 +1793,7 @@ def run_plan(rp: Replay) -> int:
     for c in rp.conflicts:
         print(f"conflict: {c}")
     report(suggest(rp), sys.stdout)
-    return 1 if rp.conflicts or lost else 0
+    return bool(rp.conflicts or lost)
 
 
 def report_dropped(held: list[str], replaced: list[str]):
@@ -1925,6 +1927,8 @@ def run_restack(git: Git, args) -> int:
     from scratch with the resolutions so far, and the pinned date makes that
     rerun rebuild the same commits.
     """
+    if args.dry_run:
+        return dry_run(git, args)
     state = load(git)
     if args.abort or args.cont:
         if not state:
@@ -1986,7 +1990,7 @@ def run_restack(git: Git, args) -> int:
         )
         if len(c.parents) == 1 and (why := upstream(rp, [c.commit], c.parents[0]).get(c.commit)):
             print(
-                f"It may already be upstream ({why}); `git-merge-stack plan` the line to see what to drop.",
+                f"It may already be upstream ({why}); `git merge-stack restack -n` the line to see what to drop.",
                 file=sys.stderr,
             )
         if carry:

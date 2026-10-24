@@ -31,8 +31,8 @@ def land(repo, *commits):
 
 def test_patch_id(repo, stack, capsys):
     land(repo, lambda: repo.git("cherry-pick", stack["s2"]))
-    code, out, err = run(repo, "plan", "origin/master > search", capsys=capsys)
-    assert code == 0, err
+    code, out, err = run(repo, "restack", "-n", "origin/master > search", capsys=capsys)
+    assert code == 1, err
     assert f"search: {stack['s2'][:12]} s2  (patch-id matches upstream)" in out
     s1, s3 = stack["s1"][:12], stack["s3"][:12]
     assert f"; origin/master > search:{s1}^..{s1},{s3}^..{s3}" in out
@@ -74,7 +74,7 @@ def test_range_diff(repo, stack, capsys):
         repo.git("add", "-A")
         repo.git("commit", "-q", "-m", "add big, as it landed")
     land(repo, changed)
-    _, out, _ = run(repo, "plan", "origin/master > big", capsys=capsys)
+    _, out, _ = run(repo, "restack", "-n", "origin/master > big", capsys=capsys)
     assert f"big: {mine[:12]} add big  (range-diff pairs it with an upstream commit)" in out
 
 
@@ -86,7 +86,7 @@ def test_empty_replay(repo, stack, capsys, monkeypatch):
         repo.git("add", "-A")
         repo.git("commit", "-q", "-m", "a bigger change")
     land(repo, squashed)
-    _, out, _ = run(repo, "plan", "origin/master > search", capsys=capsys)
+    _, out, _ = run(repo, "restack", "-n", "origin/master > search", capsys=capsys)
     assert f"search: {stack['s2'][:12]} s2  (replays as an empty commit)" in out
 
 
@@ -105,12 +105,12 @@ def test_restack_suggests_with_new_hashes(repo, stack, capsys):
 
 def test_all_upstream(repo, stack, capsys):
     land(repo, lambda: repo.git("cherry-pick", stack["s1"], stack["s2"], stack["s3"]))
-    _, out, _ = run(repo, "plan", "origin/master > search", capsys=capsys)
+    _, out, _ = run(repo, "restack", "-n", "origin/master > search", capsys=capsys)
     assert "every commit of search looks upstream" in out
 
 
 def test_nothing_upstream(repo, shape, capsys):
-    _, out, _ = run(repo, "plan", "origin/master > search > filters ; api + search > api-search", capsys=capsys)
+    _, out, _ = run(repo, "restack", "-n", "origin/master > search > filters ; api + search > api-search", capsys=capsys)
     assert "upstream" not in out
 
 
@@ -121,8 +121,8 @@ def test_range_keeps_its_gaps(repo, stack, capsys):
     land(repo, lambda: repo.git("cherry-pick", s4))
     s1, s3 = stack["s1"][:12], stack["s3"][:12]
     line = f"origin/master > search:{s1}^..{s1},{s3}^..{s4[:12]}"
-    code, out, err = run(repo, "plan", line, capsys=capsys)
-    assert code == 0, err
+    code, out, err = run(repo, "restack", "-n", line, capsys=capsys)
+    assert code == 1, err
     assert f"search: {s4[:12]} s4  (patch-id matches upstream)" in out
     assert f"; origin/master > search:{s1}^..{s1},{s3}^..{s3}" in out
     code, _, err = run(repo, "restack", out.split("add to the line:  ; ")[1].strip(), capsys=capsys)

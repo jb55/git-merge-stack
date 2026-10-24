@@ -132,16 +132,15 @@ over the remote one, then to the branch with the longer arm. When the arms
 tie, nothing says which branch owns them, so `show` picks one by name and
 warns.
 
-`plan` and `restack` don't depend on this guess: a line's `x > y` makes y's
+`restack` doesn't depend on this guess: a line's `x > y` makes y's
 commits that sit on x's own chain x's.
 
-## plan and restack
+## restack
 
-    git merge-stack plan '<line>'
-    git merge-stack restack '<line>'
+    git merge-stack restack '<line>' [-n | --dry-run]
 
-Either takes `-f FILE` (`-` for stdin), or `--stack NAME` for a saved
-stack (see [Saved stacks](#saved-stacks)), in place of the line. Each line of the
+It takes `-f FILE` (`-` for stdin), or `--stack NAME` for a saved stack
+(see [Saved stacks](#saved-stacks)), in place of the line. Each line of the
 file is a chain; a line that ends with, or one that starts with, `>`, `+` or
 `;` carries the chain on. Blank lines and `#` lines are dropped:
 
@@ -150,11 +149,11 @@ file is a chain; a line that ends with, or one that starts with, `>`, `+` or
     origin/master > feat/web-api + feat/ui-12-index > feat/web-search
     feat/web-search + feat/ui-12-ranking > feat/web-search-fixes
 
-Both replay the stack in memory with `git merge-tree --write-tree
+It replays the stack in memory with `git merge-tree --write-tree
 --merge-base=<old parent>` and `git commit-tree`, so no worktree is touched.
 Authors, author dates and messages are kept exactly; the committer is you.
 With `commit.gpgsign` set, `restack` signs every commit it writes, just
-before writing the refs (`commit-tree -S`); `plan` and a stopped restack
+before writing the refs (`commit-tree -S`); `-n` and a stopped restack
 never call gpg. Commits it reuses keep their own signatures.
 
 - The stack is every branch off the trunk plus the line's branches. A branch
@@ -173,10 +172,32 @@ never call gpg. Commits it reuses keep their own signatures.
   the new plain merge, theirs = the old merge) with a warning. Dropping such
   a merge warns too.
 
-`plan` writes no refs. It prints each moving branch with its old->new hashes
-and titles, then every conflict with its files, continuing past them on
-merge-tree's conflicted tree. It exits 1 when anything conflicts. Its new
-hashes are a preview: the committer date differs on the real run.
+`restack -n` writes nothing. It is the one command for "is the graph still
+what the line says, and what would a restack do?" It prints, in order:
+
+- how the graph differs from the line, compared by commit, not text, so
+  spacing, line breaks and a branch named by suffix don't count:
+
+      the graph differs from the line:
+        search: the line has origin/master, the graph has 1a2b3c4d5e6f
+        filters: no such branch; the line stacks it on search
+        filters: has no commits off origin/master; the line stacks it on search
+        filters: sits on search in the graph, but the line leaves it out
+
+  A branch the line writes must sit on the commits its term names, with its
+  merges in that order. A branch the graph stacks on one of the line's
+  branches must be named in the line; what sits on a fixed point, which the
+  line only reads, is not its business. A line with ranges skips this part.
+- each moving branch with its old->new hashes and titles;
+- what it would drop, and anything it would refuse (below);
+- every conflict with its files, continuing past them on merge-tree's
+  conflicted tree.
+
+It exits 0 only when they're in sync: no difference, nothing moves,
+nothing conflicts or would be refused. Anything else exits 1, so `restack
+-n` is the gate to run after a `git fetch`, or after a restack. Its new
+hashes are a preview: the committer date differs on the real run. It takes
+no `--exec`, and works while a restack is stopped.
 
 `restack` refuses a line that would drop a commit from a moving branch's
 history (moving a branch off the one it was stacked on drops that one's
@@ -187,7 +208,7 @@ lists as dropped. That last kind is found the way `git rebase --fork-point`
 finds it: a branch the line stacks on local branch `y` has its commits at
 or below `git merge-base --fork-point y` (read from y's reflog) left out of
 the replay. It replays the whole line before deciding, so the refusal
-comes before any conflict stop; `plan` prints it too. Then it stops at the
+comes before any conflict stop; `-n` prints it too. Then it stops at the
 first conflict, before writing any ref. Otherwise it
 writes one `git update-ref --stdin` transaction, guarded by the old values:
 
@@ -232,7 +253,7 @@ an older commit on purpose: put its `~N` back.
 
 ## Commits already upstream
 
-`plan` and `restack` check each moving branch's regular (non-merge) commits
+`restack` and `restack -n` check each moving branch's regular (non-merge) commits
 against what its new base brings in, merges included, and list the ones
 that look upstream already:
 
@@ -249,7 +270,7 @@ as a `name:` range:
       search: d858012dd386 s2  (patch-id matches upstream)
       to drop, add to the line:  ; origin/master > search:b178b133fa20^..b178b133fa20,227e949a1077^..227e949a1077
 
-`plan` prints the old hashes; `restack` prints the ones it just wrote, so the
+`restack -n` prints the old hashes; `restack` prints the ones it just wrote, so the
 chain applies to the restacked branch. When `restack` stops at a conflict on
 a commit that looks upstream, it says so.
 
@@ -287,10 +308,8 @@ failure stops the restack, and nothing is written.
 ## Saved stacks
 
     git merge-stack save <name> [<line> | FILE | -] [-m MSG]
-    git merge-stack check <name>
     git merge-stack list
-    git merge-stack plan --stack <name>
-    git merge-stack restack --stack <name> [<line> | -f FILE | -i]
+    git merge-stack restack --stack <name> [-n] [<line> | -f FILE | -i]
 
 A stack can be saved by name, so the line lives in git instead of a loose
 file. Each saved stack is a ref:
@@ -310,25 +329,11 @@ one-off edit, not a shape to keep.
 
 `list` prints each saved stack's name, tip and line.
 
-`check` compares the saved line with the graph and exits 1 on drift, so an
-agent can run it as a gate after a restack. It compares commits, not text,
-so spacing, line breaks and a branch named by suffix don't count. It
-prints one line per difference:
-
-    search: the line has origin/master, the graph has 1a2b3c4d5e6f
-    filters: no such branch; the line stacks it on search
-    filters: has no commits off origin/master; the line stacks it on search
-    filters: sits on search in the graph, but the line leaves it out
-
-A branch the line writes must sit on the commits its term names, with its
-merges in that order. A branch the graph stacks on one of the line's
-branches must be named in the line; what sits on a fixed point, which the
-line only reads, is not its business.
-
-`plan --stack <name>` plans the saved line. `restack --stack <name>`
-restacks it, or the line given with it (a line, `-f FILE`, or `-i` on
-HEAD's stack), and saves that line as `<name>` once the restack is done and
-`check` passes. So the ref only advances when the graph matches the line.
+`restack -n --stack <name>` says whether the graph still matches the saved
+line, and what a restack would do. `restack --stack <name>` restacks it, or
+the line given with it (a line, `-f FILE`, or `-i` on HEAD's stack), and
+saves that line as `<name>` once the restack is done and the graph matches
+it, compared as `-n` compares. So the ref only advances when the graph matches the line.
 A stopped restack saves when `--continue` finishes it. A `name:a..b` range
 is saved as plain `name`, since after the restack that branch is those
 commits; an unnamed range has no branch to keep, so `--stack` refuses it
