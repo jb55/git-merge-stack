@@ -302,3 +302,35 @@ def test_a_commit_the_branch_below_never_held_is_still_refused(repo, shape, caps
     assert code == 1
     assert f"restack would refuse: drops filters: {shape['s2'][:12]} s2" in out
     assert "old copies" not in out
+
+
+def test_a_swapped_merge_gets_a_title_that_says_what_it_merges(repo, shape, capsys):
+    # The line swaps lane's base and merge, so its old merge is paired with
+    # the new one; restack's own title is rewritten, not kept.
+    repo.checkout("-b", "lane", "api")
+    repo.commit("l1")
+    code, _, err = run(repo, "restack", "search + api > lane", capsys=capsys)
+    assert code == 0, err
+    assert repo.git("log", "-1", "--format=%s", "lane^") == "Merge api into lane"
+    repo.git("update-ref", "-d", repo.git("for-each-ref", "--format=%(refname)", "refs/stack-backup/"))
+    code, _, err = run(repo, "restack", "api + search > lane", capsys=capsys)
+    assert code == 0, err
+    assert repo.git("log", "-1", "--format=%s", "lane^") == "Merge search into lane"
+    assert repo.rev("lane^^1") == repo.rev("api") and repo.rev("lane^^2") == repo.rev("search")
+
+
+def test_a_stale_title_is_rewritten_even_when_the_parents_match(repo, shape, capsys):
+    repo.checkout("-b", "lane", "api")
+    merge = repo.merge("search", "Merge api into lane")
+    repo.commit("l1")
+    code, _, err = run(repo, "restack", "api + search > lane", capsys=capsys)
+    assert code == 0, err
+    assert repo.rev("lane^") != merge
+    assert repo.git("log", "-1", "--format=%s", "lane^") == "Merge search into lane"
+    assert repo.git("rev-parse", "lane^^{tree}") == repo.git("rev-parse", f"{merge}^{{tree}}")
+    # A title someone wrote is theirs: kept even when it doesn't match.
+    repo.checkout("-b", "lane2", "api")
+    mine = repo.merge("search", "Merge branch 'search' into lane2, for the index")
+    code, _, err = run(repo, "restack", "api + search > lane2", capsys=capsys)
+    assert code == 0, err
+    assert repo.rev("lane2") == mine

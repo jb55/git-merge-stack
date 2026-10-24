@@ -619,6 +619,8 @@ def short(full: str) -> str:
 # ============================================================================
 
 AUTHOR = re.compile(r"(.*) <(.*)> (\d+) ([+-]\d{4})$")
+# The message restack writes for a merge the line adds: `_merge`.
+MERGE_TITLE = re.compile(r"Merge (\S+) into (\S+)\n*")
 
 
 @dataclass
@@ -834,7 +836,7 @@ class Replay:
         cur = self.new_base[b] = self._new(refs[0])
         for i, r in enumerate(refs[1:]):
             old = merges[i] if i < len(merges) else None
-            cur = self._merge(b, old, cur, self._new(r), r.token)
+            cur = self._merge(b, old, cur, self._new(r), r.token, self._title(b, old, r))
         self.below[b] = cur
         kept = {c for run in self.ranges.get(b, ()) for c in run}
         for m in merges[len(refs) - 1:]:
@@ -877,20 +879,31 @@ class Replay:
         self.map[c] = new
         return new
 
-    def _merge(self, b: str, old: str | None, p1: str, p2: str, token: str) -> str:
+    def _title(self, b: str, old: str | None, r: Ref) -> str | None:
+        """A new message for an old merge whose title restack wrote from
+        MERGE_TITLE and that no longer says what it merges, as when a line
+        swaps a base and a merge; None keeps the old message as written."""
+        m = MERGE_TITLE.fullmatch(self.commit(old).message) if old else None
+        names = {r.token, r.branch + r.token[len(ref_name(r.token)):]} if r.branch else {r.token}
+        if not m or (m[1] in names and m[2] == b):
+            return None
+        return f"Merge {r.token} into {b}\n"
+
+    def _merge(self, b: str, old: str | None, p1: str, p2: str, token: str, title: str | None = None) -> str:
         if old and self.commit(old).parents == [p1, p2]:
-            self.map[old] = old
-            return old
+            new = self._write(old, self.commit(old).tree, [p1, p2], title) if title else old
+            self.map[old] = new
+            return new
         key = old or f"{b}+{token}"
         if key in self.resolved:
             tree, files = self.resolved[key], []
         else:
             tree, files = self._merged(b, old, p1, p2)
         if files:
-            title = self.commit(old).title if old else f"merge {token}"
-            self._conflict(Conflict(b, old, title, files, [p1, p2], token))
+            what = self.commit(old).title if old else f"merge {token}"
+            self._conflict(Conflict(b, old, what, files, [p1, p2], token))
         if old:
-            new = self._write(old, tree, [p1, p2])
+            new = self._write(old, tree, [p1, p2], title)
             self.map[old] = new
             return new
         return self._write(None, tree, [p1, p2], f"Merge {token} into {b}\n")
@@ -942,13 +955,14 @@ class Replay:
         return self._commits[c]
 
     def _write(self, old: str | None, tree: str, parents: list[str], message: str | None = None) -> str:
-        """commit-tree with the old commit's author and message, kept exactly."""
+        """commit-tree with the old commit's author, and its message kept
+        exactly unless `message` replaces it."""
         env = {}
         if self.date is not None:
             env["GIT_COMMITTER_DATE"] = env["GIT_AUTHOR_DATE"] = f"@{self.date} +0000"
         if old:
             info = self.commit(old)
-            message = info.message
+            message = message or info.message
             if m := AUTHOR.match(info.author):
                 env |= {
                     "GIT_AUTHOR_NAME": m[1],

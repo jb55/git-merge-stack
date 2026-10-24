@@ -179,6 +179,11 @@ never call gpg. Commits it reuses keep their own signatures.
   carried forward as a three-way merge (base = the old plain merge, ours =
   the new plain merge, theirs = the old merge) with a warning. Dropping such
   a merge warns too.
+- A merge the line adds is titled `Merge <ref> into <branch>`. A paired old
+  merge keeps its message, unless restack wrote it in that form and it no
+  longer names the ref merged or the branch, say after the line swapped a
+  base and a merge. Then the title is rewritten, even when that merge is
+  otherwise reused. A title anyone else wrote is kept as written.
 
 `restack -n` writes nothing. It is the one command for "is the graph still
 what the line says, and what would a restack do?" It prints, in order:
