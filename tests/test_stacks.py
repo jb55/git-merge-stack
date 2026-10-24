@@ -155,7 +155,7 @@ def test_drift_when_the_trunk_moves(repo, shape, capsys):
     assert code == 1
     assert out.startswith(
         "the graph differs from the line:\n"
-        f"  search: the line has origin/master, the graph has {shape['m1'][:12]}\n"
+        f"  search: the line has origin/master, the graph has {shape['m1'][:12]} (2 behind origin/master)\n"
         "search: "
     )
 

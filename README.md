@@ -82,7 +82,7 @@ it. Piped, as in `$(git merge-stack show)`, it prints only the line, with no
 color, because that is what `restack` reads. `--tree` and `--line` pick one
 form either way.
 
-    ae4655a25e9c
+    ae4655a25e9c  2 behind origin/master
     └─ feat/ui-12-index             2 commits
        └─ feat/ui-12-ranking        1 commit
     origin/master
@@ -95,6 +95,14 @@ when that's the trunk, a hash or a ref outside the stack. A `~N` base hangs
 under its branch with `on X~N` on the row, since it sits below the tip. `+`
 merges are labels on the right. The count is the branch's own commits, its
 merges included.
+
+A root that is an older trunk commit, by hash or by a ref such as a stale
+local `master`, says how many commits the trunk has gained since: `2 behind
+origin/master`. Every branch under that root sits that far back, since the
+ones above it build on its stack commits. A root at the trunk's tip prints
+bare, so a stack hanging under `origin/master` is up to date with it. Run `git
+fetch` first, since the count is against your copy of the trunk. `restack -i`
+puts the same tree, counts included, in its comments.
 
 On a terminal, a name that shares a prefix with another name in the line, cut
 at a `/` or `-`, has its longest such prefix dimmed (`feat/ui-12-`), in
@@ -179,7 +187,7 @@ what the line says, and what would a restack do?" It prints, in order:
   spacing, line breaks and a branch named by suffix don't count:
 
       the graph differs from the line:
-        search: the line has origin/master, the graph has 1a2b3c4d5e6f
+        search: the line has origin/master, the graph has 1a2b3c4d5e6f (2 behind origin/master)
         filters: no such branch; the line stacks it on search
         filters: has no commits off origin/master; the line stacks it on search
         filters: sits on search in the graph, but the line leaves it out

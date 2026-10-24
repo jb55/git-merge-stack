@@ -17,7 +17,7 @@ def on_tty(monkeypatch):
 def test_tree_of_heads_stack(repo, shape, capsys):
     repo.checkout("api-search")
     assert show(repo, "--tree", capsys=capsys) == (
-        f"{shape['m1'][:12]}\n"
+        f"{shape['m1'][:12]}  2 behind origin/master\n"
         "└─ search         2 commits\n"
         "   └─ filters     1 commit\n"
         "origin/master\n"
@@ -39,7 +39,7 @@ def test_card_names_dim_their_shared_prefixes(repo, shape, capsys, on_tty):
     repo.commit("z1")
     out = show(repo, capsys=capsys).replace("\033[2m", "«").replace("\033[22m", "»")
     assert out == (
-        f"{shape['m1'][:12]}\n"
+        f"{shape['m1'][:12]}  2 behind origin/master\n"
         "└─ «feat/ui-12-»index             2 commits\n"
         "   └─ «feat/ui-12-»ranking        1 commit\n"
         "origin/master\n"
@@ -58,7 +58,7 @@ def test_tilde_base_hangs_under_its_branch(repo, shape, capsys):
     repo.commit("t1")
     out = show(repo, "--tree", "--only", "search", "side", capsys=capsys)
     assert out == (
-        f"{shape['m1'][:12]}\n"
+        f"{shape['m1'][:12]}  2 behind origin/master\n"
         "└─ search   2 commits\n"
         "   └─ side  1 commit   on search~1\n"
     )
@@ -75,6 +75,16 @@ def test_base_outside_the_stack_is_a_root(repo, shape, capsys):
     assert out == "origin/api~1\n└─ api-search  3 commits  + search\n"
 
 
+def test_a_ref_on_an_old_trunk_commit_says_how_far_behind(repo, shape, capsys):
+    repo.git("tag", "old", shape["m1"])
+    out = show(repo, "--tree", "--only", "search", "filters", capsys=capsys)
+    assert out == (
+        "old  2 behind origin/master\n"
+        "└─ search      2 commits\n"
+        "   └─ filters  1 commit\n"
+    )
+
+
 def test_piped_default_is_the_plain_line(repo, shape, capsys):
     repo.git("branch", "-m", "search", "feat/a-search")
     repo.git("branch", "-m", "filters", "feat/a-fix")
@@ -85,7 +95,7 @@ def test_piped_default_is_the_plain_line(repo, shape, capsys):
 def test_tty_default_is_tree_then_line(repo, shape, capsys, on_tty):
     out = show(repo, "--only", "search", "filters", capsys=capsys)
     tree, line = out.split("\n\n")
-    assert tree.startswith(shape["m1"][:12] + "\n└─ search")
+    assert tree.startswith(shape["m1"][:12] + "  2 behind origin/master\n└─ search")
     assert line == f"{shape['m1'][:12]} > search > filters\n"
 
 

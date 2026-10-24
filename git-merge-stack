@@ -1419,8 +1419,26 @@ def paint_line(line: str, dims: dict[str, str], color: bool) -> str:
     return re.sub(r"[^\s>+;]+", lambda m: paint(m.group(), dims, color), line) if color else line
 
 
-def tree(derived: dict[str, Branch], color: bool) -> str:
-    """Draw the branches as a tree of bases, a commit count and merges on each row."""
+def behind(graph: Graph, c: str) -> str | None:
+    """How far the trunk has moved past c, when c is an older trunk commit."""
+    if c in graph.parents or c == graph.trunk_commit:
+        return None
+    return f"{graph.git.out('rev-list', '--count', f'{c}..{graph.trunk_commit}')} behind {short(graph.trunk)}"
+
+
+def roots_behind(graph: Graph, derived: dict[str, Branch]) -> dict[str, str]:
+    """Each tree root that is an older trunk commit -> how far behind the trunk it is."""
+    out = {}
+    for d in derived.values():
+        root = d.term[0]
+        if ref_name(root) not in derived and root not in out and (note := behind(graph, d.base)):
+            out[root] = note
+    return out
+
+
+def tree(derived: dict[str, Branch], color: bool, notes: dict[str, str] | None = None) -> str:
+    """Draw the branches as a tree of bases, a commit count and merges on each row.
+    A root in `notes` carries its note, say how far behind the trunk it is."""
     terms = {b: d.term for b, d in derived.items()}
     dims = shared_prefixes(names(terms))
     order = topo_order(terms)
@@ -1447,7 +1465,7 @@ def tree(derived: dict[str, Branch], color: bool) -> str:
             walk(k, indent + ("   " if last else "│  "))
 
     for r in roots:
-        rows.append(("", r, "", ""))
+        rows.append(("", r, "", (notes or {}).get(r, "")))
         walk(r, "")
     name_w = max(len(i) + len(n) for i, n, c, _ in rows if c)
     count_w = max(len(c) for _, _, c, _ in rows)
@@ -1455,7 +1473,7 @@ def tree(derived: dict[str, Branch], color: bool) -> str:
     for indent, name, count, labels in rows:
         pad = " " * (name_w - len(indent) - len(name))
         row = f"{indent}{paint(name, dims, color)}{pad}  {count:<{count_w}}  {labels}"
-        out.append(row.rstrip() if count else indent + paint(name, dims, color))
+        out.append(row.rstrip() if count else f"{indent}{paint(name, dims, color)}{'  ' * bool(labels)}{labels}")
     return "\n".join(out)
 
 
@@ -1570,7 +1588,8 @@ def drift(graph: Graph, line: str) -> list[str]:
         if not d.own and d.tip not in graph.parents:
             out.append(f"{b}: has no commits off {short(graph.trunk)}; the line stacks it on {format_term(term)}")
         else:
-            out.append(f"{b}: the line has {format_term(term)}, the graph has {format_term(d.term)}")
+            note = f" ({n})" if (n := behind(graph, d.base)) else ""
+            out.append(f"{b}: the line has {format_term(term)}, the graph has {format_term(d.term)}{note}")
 
     named = set(written) | {n for t in parents.values() for r in t if (n := local(r))}
     users: dict[str, set[str]] = defaultdict(set)
@@ -1684,7 +1703,7 @@ def main(argv: list[str] | None = None) -> int:
             color = tty() and not args.no_color
             parts = []
             if args.tree or (tty() and not args.line):
-                parts.append(tree(derived, color))
+                parts.append(tree(derived, color, roots_behind(graph, derived)))
             if not args.tree:
                 parts.append(paint_line(format_line(terms), shared_prefixes(names(terms)), color))
             print("\n\n".join(parts))
@@ -1902,7 +1921,7 @@ def head_line(git: Git, args) -> str | int:
         for b, d in derived.items() if d.tied and terms[b][0] != d.term[0]
     ])
     if args.interactive:
-        saved = edit(git, line, old, changed, tree(derived, color=False))
+        saved = edit(git, line, old, changed, tree(derived, False, roots_behind(graph, derived)))
         if saved is None:
             return 1
         line = saved
