@@ -708,6 +708,22 @@ class Replay:
                 on_x = [c for c in self.own[b] if c in self.g.chain[base.branch]]
                 if on_x:
                     self._claim(base.branch, on_x[-1])
+        # Commits a branch the line writes has at or below where it forked
+        # from an older tip of its base branch are that branch's old copies,
+        # which it has since rewritten: not replayed, the way `git rebase
+        # --fork-point` skips them.
+        self.fork: dict[str, tuple[str, str]] = {}
+        for b, term in written.items():
+            base = self._resolve(term[0])
+            if b not in self.own or not base.follow or base.branch not in self.g.locals:
+                continue
+            p = self.git.run("merge-base", "--fork-point", f"refs/heads/{base.branch}", self.old_tip[b], check=False)
+            if fork := p.stdout.strip():
+                self.fork[b] = (base.branch, fork)
+                anc = lambda c: not self.git.run("merge-base", "--is-ancestor", c, fork, check=False).returncode
+                cut = next((i for i, c in enumerate(self.own[b]) if anc(c)), None)
+                if cut is not None and not any(len(self.g.parents[c]) == 2 for c in self.own[b][cut:]):
+                    del self.own[b][cut:]
         self.term.update(written)
         self.order = self._order()
 
@@ -981,22 +997,30 @@ class Written:
     failed: list[tuple[str, str, str]] = field(default_factory=list)
 
 
-def dropped(rp: Replay) -> tuple[list[str], list[str]]:
+def dropped(rp: Replay) -> tuple[list[str], list[str], list[str]]:
     """Each stack commit a moving branch had that its new history lacks,
     save those a named range leaves out on purpose: the ones that would be
-    lost, and the ones whose patch the new history already holds (`git
-    cherry`), which lose nothing."""
-    g, lost, held = rp.g, [], []
+    lost; the ones whose patch the new history already holds (`git
+    cherry`); and the ones its base branch held once and has since
+    rewritten, below that branch's fork point (`git merge-base
+    --fork-point`, from its reflog), the old copies a rebase skips too.
+    The last two lose nothing."""
+    g, lost, held, replaced = rp.g, [], [], []
     for b in rp.moved():
         x, tip = rp.old_tip[b], rp.new_tip[b]
+        fork = rp.fork.get(b)
         while x in g.parents:
             new = rp.map.get(x, x)
             if x not in rp.dropping and g.git.run("merge-base", "--is-ancestor", new, tip, check=False).returncode:
                 d = f"{b}: {x[:12]} {rp.commit(x).title}"
-                same = len(g.parents[x]) == 1 and g.git.out("cherry", tip, x, g.parents[x][0]).startswith("-")
-                (held if same else lost).append(d)
+                if len(g.parents[x]) == 1 and g.git.out("cherry", tip, x, g.parents[x][0]).startswith("-"):
+                    held.append(d)
+                elif fork and not g.git.run("merge-base", "--is-ancestor", x, fork[1], check=False).returncode:
+                    replaced.append(f"{d}  (an old copy of {fork[0]}'s)")
+                else:
+                    lost.append(d)
             x = g.parents[x][0] if g.parents[x] else None
-    return lost, held
+    return lost, held, replaced
 
 
 def sign(rp: Replay):
@@ -1760,8 +1784,8 @@ def run_plan(rp: Replay) -> int:
     print_moves(rp, moved)
     if not moved:
         print("nothing moves")
-    lost, held = dropped(rp)
-    report_dropped(held)
+    lost, held, replaced = dropped(rp)
+    report_dropped(held, replaced)
     for d in lost:
         print(f"restack would refuse: drops {d}")
     for c in rp.conflicts:
@@ -1770,10 +1794,14 @@ def run_plan(rp: Replay) -> int:
     return 1 if rp.conflicts or lost else 0
 
 
-def report_dropped(held: list[str]):
+def report_dropped(held: list[str], replaced: list[str]):
     if held:
         print("dropped, their patch is already in the new history:")
         for d in held:
+            print(f"  {d}")
+    if replaced:
+        print("dropped, old copies of commits the branch below has since rewritten:")
+        for d in replaced:
             print(f"  {d}")
 
 
@@ -1935,7 +1963,7 @@ def run_restack(git: Git, args) -> int:
     # would have made.
     rp = Replay(graph, state["line"], resolved=state["resolved"], date=state["date"]).run()
     warn(rp.warnings)
-    lost, held = dropped(rp)
+    lost, held, replaced = dropped(rp)
     if lost:
         clear(git, state)
         print("git-merge-stack: refusing: the line drops these commits from their branches:", file=sys.stderr)
@@ -1984,7 +2012,7 @@ def run_restack(git: Git, args) -> int:
     clear(git, state)
     done = write(rp)
     print_moves(rp, done.moved)
-    report_dropped(held)
+    report_dropped(held, replaced)
     if done.moved:
         print(f"backups: {done.backup}")
     if unwritten := [b for b in rp.moved() if b not in rp.written]:

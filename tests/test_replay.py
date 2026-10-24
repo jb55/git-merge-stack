@@ -272,3 +272,33 @@ def test_a_branch_grown_at_its_tip_keeps_its_commits(repo, shape, capsys):
     assert repo.rev("search~3") == shape["m3"]
     out, _ = repo.show("--only", "search", "filters", capsys=capsys)
     assert out == "origin/master > search > filters"
+
+
+def test_drops_an_old_copy_the_branch_below_rewrote(repo, shape, capsys):
+    # fixes sits on api's x1; then x1 is amended with new content, so the
+    # old copy's patch matches nothing. api's reflog says it was api's.
+    repo.checkout("-b", "fixes", "api")
+    y1 = repo.commit("y1")
+    repo.checkout("api")
+    (repo.path / "x1").write_text("x1 amended\n")
+    repo.git("commit", "-q", "-a", "--amend", "-m", "x1")
+    line = "api > fixes"
+    code, out, err = run(repo, "plan", line, capsys=capsys)
+    assert code == 0, out + err
+    assert (
+        "dropped, old copies of commits the branch below has since rewritten:\n"
+        f"  fixes: {shape['x1'][:12]} x1  (an old copy of api's)\n"
+    ) in out
+    code, out, err = run(repo, "restack", line, capsys=capsys)
+    assert code == 0, err
+    assert repo.rev("fixes~1") == repo.rev("api")
+    assert repo.git("log", "-1", "--format=%s", "fixes") == "y1" and repo.rev("fixes") != y1
+
+
+def test_a_commit_the_branch_below_never_held_is_still_refused(repo, shape, capsys):
+    # search's commits under filters were never api's, so moving filters
+    # onto api loses them from filters, fork point or not.
+    code, out, _ = run(repo, "plan", "api > filters", capsys=capsys)
+    assert code == 1
+    assert f"restack would refuse: drops filters: {shape['s2'][:12]} s2" in out
+    assert "old copies" not in out

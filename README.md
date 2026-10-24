@@ -180,9 +180,13 @@ hashes are a preview: the committer date differs on the real run.
 
 `restack` refuses a line that would drop a commit from a moving branch's
 history (moving a branch off the one it was stacked on drops that one's
-commits from it), save the commits a `name:` range leaves out on purpose and
-those whose patch the new history already holds (`git cherry`), which it
-lists as dropped. It replays the whole line before deciding, so the refusal
+commits from it), save the commits a `name:` range leaves out on purpose,
+those whose patch the new history already holds (`git cherry`), and old
+copies of commits the branch below has since amended or rebased, which it
+lists as dropped. That last kind is found the way `git rebase --fork-point`
+finds it: a branch the line stacks on local branch `y` has its commits at
+or below `git merge-base --fork-point y` (read from y's reflog) left out of
+the replay. It replays the whole line before deciding, so the refusal
 comes before any conflict stop; `plan` prints it too. Then it stops at the
 first conflict, before writing any ref. Otherwise it
 writes one `git update-ref --stdin` transaction, guarded by the old values:
